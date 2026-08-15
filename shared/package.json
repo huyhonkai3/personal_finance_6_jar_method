@@ -1,0 +1,9 @@
+{
+  "name": "@six-jars/shared",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "schemas/index.js",
+  "dependencies": {
+    "zod": "^3.24.0"
+  }
+}

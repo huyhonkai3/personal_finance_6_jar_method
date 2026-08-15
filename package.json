@@ -1,0 +1,5 @@
+{
+  "name": "six-jars-app",
+  "private": true,
+  "workspaces": ["server", "client", "shared"]
+}
