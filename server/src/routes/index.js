@@ -1,2 +1,7 @@
 // Gộp toàn bộ router con, mount dưới prefix /api/v1
 // vi du: router.use('/auth', authRoutes); router.use('/jars', jarRoutes); ...
+import { Router } from "express";
+
+const router = Router();
+
+export default router;

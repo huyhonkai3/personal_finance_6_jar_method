@@ -1,5 +1,15 @@
 {
   "name": "six-jars-app",
   "private": true,
-  "workspaces": ["server", "client", "shared"]
+  "workspaces": [
+    "server",
+    "client",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev --workspace=server\" \"npm run dev --workspace=client\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
 }
