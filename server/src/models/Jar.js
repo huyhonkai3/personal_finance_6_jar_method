@@ -73,7 +73,7 @@ export const Jar = mongoose.model("Jar", jarSchema);
 // Không đổi thứ tự các phần tử - `order` field bên dưới phụ thuộc vị trí này
 export const DEFAULT_JARS = [
   {
-    key: "essentail",
+    key: "essential",
     displayName: "Thiết yếu",
     percentage: 55,
     sensitivityGroup: "flexible",

@@ -49,7 +49,7 @@ export async function updateJarRatios(req, res) {
   // 2. Validate danh sách jarId gửi lên đúng khớp 6 lọ hiện có của user - tránh trường hợp
   // gửi thiếu/thừa/nhầm jarId của user khác.
   const jars = await Jar.find({ userId: req.userId });
-  if (jars.lenght !== REQUIRED_JAR_COUNT) {
+  if (jars.length !== REQUIRED_JAR_COUNT) {
     throw new AppError(
       500,
       "JAR_SETUP_INCOMPLETE",
@@ -84,7 +84,7 @@ export async function updateJarRatios(req, res) {
     })),
   );
 
-  const updateJars = await Jar.find({ useId: req.userId }).sort({
+  const updateJars = await Jar.find({ userId: req.userId }).sort({
     order: 1,
   });
   res.status(200).json({ jars: updateJars });
