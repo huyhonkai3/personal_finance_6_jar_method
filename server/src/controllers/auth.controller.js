@@ -18,7 +18,9 @@ import { z } from "zod";
 import { env } from "../config/env.js";
 import { User } from "../models/User.js";
 import { RefreshToken } from "../models/RefreshToken.js";
-import { AppError } from "../utils/AppError";
+import { Jar, DEFAULT_JARS } from "../models/Jar.js";
+import { AppError } from "../utils/AppError.js";
+import { getOrCreateCurrentPeriod } from "../services/periodService.js";
 
 const ACCESS_TOKEN_TTL = "15m";
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 ngày
@@ -95,12 +97,25 @@ export async function register(req, res) {
 
   const passwordHash = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
 
-  // Giai đoạn 1: Chưa seed Jar / FinancialPeriod - để giai đoạn 2 làm.
   const user = await User.create({
     email: normalizedEmail,
     passwordHash,
     name,
   });
+
+  // Giai đoạn 2: seed 6 Jar mặc định (55-10-10-10-10-5) + tạo FinancialPeriod
+  // đầu tiên (status: 'open') ngay khi đăng ký - US 3.1 AC1.
+  // Không dùng Mongo transaction ở đây (tương tự lý do đã ghi chú ở jar.controller.js#updateJarRatios):
+  // seed dữ liệu của chính user vừa tạo, rủi ro va chạm gần như bằng 0, và tránh phụ thuộc replica set khi dev.
+  await Jar.insertMany(
+    DEFAULT_JARS.map((jar) => ({ ...jar, userId: user._id })),
+  );
+
+  await getOrCreateCurrentPeriod(user._id);
+  // `hasCompletedJarSetup` không được set true ở đây: field này gate màn
+  // hình thiết lập tỷ lệ lọ lần đầu (US 3.1 AC1) phía Frontend -user vẫn cần
+  // đi qua/xác nhận màn hình đó dù đã có sẵn tỷ lệ gợi ý mặc định. Việc set true sẽ là
+  // trách nhiệm của luồng "hoàn tất thiết lập lọ" khi Frontend được triển khai.
 
   const accessToken = signAccessToken(user._id);
   const refreshToken = await issueRefreshToken(user._id);
