@@ -1,27 +1,21 @@
-// Zod schema: validate body cho /transactions/parse, /parse-bulk,
-// /bulk-confirm, PATCH /transactions/:id/jar (Giai đoạn 3).
-// (expense-followup, PATCH /transactions/:id - để dành Giai đoạn 7, 8)
+// Zod schema cho Transaction APIs.
 import { z } from "zod";
 
 const objectIdSchema = z.string().regex(/^[0-9a-fA-F]{24}$/, "id không hợp lệ");
 
-// Body của POST /transactions/parse
 export const parseTransactionSchema = z.object({
   rawText: z.string().trim().min(1, "Nội dung không được để trống"),
   transactionDate: z.coerce.date().optional(),
 });
 
-// Body của POST /transactions/parse-bulk
 export const parseBulkTransactionSchema = z.object({
   rawText: z.string().trim().min(1, "Nội dung không được để trống"),
   transactionDate: z.coerce.date().optional(),
 });
 
-// 1 item trong mảng `items` gửi lên POST /transactions/bulk-confirm - chính
-// là staging item trả về từ /parse-bulk, có thể đã được user sửa lại ở màn
-// hình Review (US1.5 AC2) trước khi gửi lên.
 export const bulkConfirmItemSchema = z.object({
   clientLineId: z.string().min(1),
+  rawText: z.string().optional(),
   amount: z.number().positive().nullable(),
   description: z.string(),
   jarId: objectIdSchema.nullable(),
@@ -30,32 +24,51 @@ export const bulkConfirmItemSchema = z.object({
   isIncome: z.boolean(),
 });
 
-// Body của POST /transactions/bulk-confirm
 export const bulkConfirmSchema = z.object({
   items: z.array(bulkConfirmItemSchema).min(1, "Không có dòng nào để lưu"),
   transactionDate: z.coerce.date().optional(),
 });
 
-// Body của PATCH /transactions/:id/jar
+const pendingExpenseSchema = z.object({
+  amount: z.number().positive(),
+  rawText: z.string().optional(),
+  description: z.string().optional().default(""),
+  jarId: objectIdSchema,
+  isPredicted: z.boolean().optional().default(false),
+  predictionConfidence: z.number().min(0).max(1).nullable().optional(),
+  matchedDictionaryRuleId: objectIdSchema.nullable().optional(),
+  transactionDate: z.coerce.date().optional(),
+});
+
+export const expenseFollowupSchema = z
+  .object({
+    pendingExpense: pendingExpenseSchema,
+    decision: z.enum(["borrow", "skip"]),
+    borrowFromJarId: objectIdSchema.optional(),
+    confirmSensitiveWarning: z.boolean().optional().default(false),
+  })
+  .refine(
+    (data) => data.decision !== "borrow" || Boolean(data.borrowFromJarId),
+    {
+      message: "borrowFromJarId là bắt buộc khi decision = borrow",
+      path: ["borrowFromJarId"],
+    },
+  );
+
 export const updateTransactionJarSchema = z.object({
   jarId: objectIdSchema,
 });
 
-// Param :id trên các route /transactions/:id...
 export const transactionIdParamSchema = z.object({
   id: objectIdSchema,
+});
+
+export const listTransactionsQuerySchema = z.object({
   periodId: objectIdSchema.optional(),
   jarId: objectIdSchema.optional(),
   type: z.enum(["expense", "income", "transfer", "adjustment"]).optional(),
   dateFrom: z.coerce.date().optional(),
   dateTo: z.coerce.date().optional(),
-  page: z.coerce.number().int().positive().optional(),
-  limit: z.coerce.number().int().positive().max(100).optional(),
-});
-
-// Query params của GET /transactions
-export const listTransactionQuerySchema = z.object({
-  periodId: objectIdSchema.optional(),
-  jarId: objectIdSchema.optional(),
-  type: z.enum[("expense", "income", "transfer", "adjustment")].optional(),
+  page: z.coerce.number().int().positive().optional().default(1),
+  limit: z.coerce.number().int().positive().max(100).optional().default(20),
 });
