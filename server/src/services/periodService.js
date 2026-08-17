@@ -74,6 +74,16 @@ export async function snapshotPeriod(period, referenceDate = new Date()) {
     return null;
   }
 
+  // Không snapshot kỳ sau khi kỳ trước vẫn chờ quyết định rollover/sweep.
+  // Nếu làm vậy, openingBalance của kỳ sau chưa xác định nên closingBalance
+  // vừa snapshot sẽ sai và tạo cascade sai cho Recalculation Engine sau này.
+  const olderPending = await FinancialPeriod.exists({
+    userId: period.userId,
+    status: "pending_close",
+    endDate: { $lt: period.endDate },
+  });
+  if (olderPending) return null;
+
   const jars = await Jar.find({ userId: period.userId }).sort({ order: 1 });
   const stats = await JarPeriodStat.find({
     userId: period.userId,
@@ -94,8 +104,6 @@ export async function snapshotPeriod(period, referenceDate = new Date()) {
     );
   }
 
-  // Claim trạng thái sau khi tính snapshot. Chỉ một worker thắng được điều kiện
-  // status=open; các worker khác không tạo lặp kỳ mới/notification.
   const claimed = await FinancialPeriod.findOneAndUpdate(
     { _id: period._id, status: "open", endDate: { $lte: referenceDate } },
     {
@@ -260,8 +268,6 @@ export async function closeFinancialPeriod(userId, periodId, decisions) {
       { upsert: true, setDefaultsOnInsert: true },
     );
 
-    // Chỉ sweep phần dư dương. Số dư <= 0 phải tiếp tục nằm ở chính lọ đó để
-    // không biến khoản thiếu hụt thành tiền chuyển sang lọ Tiết kiệm.
     const shouldSweep =
       action === "sweep" &&
       closingBalance > 0 &&
@@ -281,7 +287,10 @@ export async function closeFinancialPeriod(userId, periodId, decisions) {
 
     if (shouldSweep) {
       await Promise.all([
-        Jar.updateOne({ _id: jar._id, userId }, { $inc: { balance: -closingBalance } }),
+        Jar.updateOne(
+          { _id: jar._id, userId },
+          { $inc: { balance: -closingBalance } },
+        ),
         Jar.updateOne(
           { _id: sweepTarget._id, userId },
           { $inc: { balance: closingBalance } },
@@ -292,6 +301,10 @@ export async function closeFinancialPeriod(userId, periodId, decisions) {
 
   period.status = "closed";
   await period.save();
+
+  // Nếu user bỏ app qua nhiều kỳ, sau khi chốt kỳ cũ nhất thì lập tức cho
+  // kỳ kế tiếp đủ điều kiện chuyển sang pending_close (nếu nó cũng đã hết hạn).
+  await snapshotDuePeriodsForUser(userId, new Date());
 
   return { period, nextPeriod };
 }
