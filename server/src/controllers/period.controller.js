@@ -37,10 +37,5 @@ export async function closePeriod(req, res) {
     req.params.id,
     req.body.decisions,
   );
-
-  // Data Model yêu cầu lưu thời điểm user hoàn tất modal chốt tháng.
-  result.period.closedAt = new Date();
-  await result.period.save();
-
   res.status(200).json(result);
 }
