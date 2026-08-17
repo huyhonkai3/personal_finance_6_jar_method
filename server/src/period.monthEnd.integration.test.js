@@ -1,3 +1,4 @@
+import "dotenv/config";
 import mongoose from "mongoose";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -51,7 +52,7 @@ describe.skipIf(!hasTestDb)("Giai đoạn 6 - late month-end integration", () =>
     await mongoose.disconnect();
   });
 
-  it("snapshot kỳ cũ, khóa app, cho expense vào kỳ mới rồi mở khóa sau close", async () => {
+  it("snapshot kỳ cũ, khóa app, cho expense vào kỳ mới, sweep/rollover rồi mở khóa", async () => {
     const email = `phase6-${Date.now()}@example.com`;
     const registerResponse = await request(app).post("/api/v1/auth/register").send({
       email,
@@ -65,6 +66,8 @@ describe.skipIf(!hasTestDb)("Giai đoạn 6 - late month-end integration", () =>
 
     const jars = await Jar.find({ userId }).sort({ order: 1 });
     expect(jars).toHaveLength(6);
+    const essentialJar = jars[0];
+    const savingsJar = jars.find((jar) => jar.isSweepTarget);
 
     const oldPeriod = await FinancialPeriod.findOne({ userId, status: "open" });
     oldPeriod.periodKey = `integration-old-${Date.now()}`;
@@ -72,15 +75,26 @@ describe.skipIf(!hasTestDb)("Giai đoạn 6 - late month-end integration", () =>
     oldPeriod.endDate = new Date(Date.now() - 1000);
     await oldPeriod.save();
 
-    await JarPeriodStat.create({
-      userId,
-      jarId: jars[0]._id,
-      periodId: oldPeriod._id,
-      openingBalance: 100_000,
-      allocatedIncome: 50_000,
-      totalExpense: 20_000,
-      spendingLimit: 150_000,
-    });
+    await Promise.all([
+      JarPeriodStat.create({
+        userId,
+        jarId: essentialJar._id,
+        periodId: oldPeriod._id,
+        openingBalance: 100_000,
+        allocatedIncome: 50_000,
+        totalExpense: 20_000,
+        spendingLimit: 150_000,
+      }),
+      JarPeriodStat.create({
+        userId,
+        jarId: savingsJar._id,
+        periodId: oldPeriod._id,
+        openingBalance: 50_000,
+        spendingLimit: 50_000,
+      }),
+      Jar.updateOne({ _id: essentialJar._id }, { $set: { balance: 130_000 } }),
+      Jar.updateOne({ _id: savingsJar._id }, { $set: { balance: 50_000 } }),
+    ]);
 
     const currentResponse = await request(app)
       .get("/api/v1/periods/current")
@@ -117,7 +131,7 @@ describe.skipIf(!hasTestDb)("Giai đoạn 6 - late month-end integration", () =>
 
     expect(summaryResponse.status).toBe(200);
     const essentialSummary = summaryResponse.body.jars.find(
-      (item) => String(item.jarId) === String(jars[0]._id),
+      (item) => String(item.jarId) === String(essentialJar._id),
     );
     expect(essentialSummary.closingBalance).toBe(130_000);
 
@@ -127,20 +141,49 @@ describe.skipIf(!hasTestDb)("Giai đoạn 6 - late month-end integration", () =>
       .send({
         decisions: jars.map((jar) => ({
           jarId: String(jar._id),
-          action: "rollover",
+          action:
+            String(jar._id) === String(essentialJar._id)
+              ? "sweep"
+              : "rollover",
         })),
       });
 
     expect(closeResponse.status).toBe(200);
     expect(closeResponse.body.period.status).toBe("closed");
 
-    const nextStat = await JarPeriodStat.findOne({
+    const [essentialNextStat, savingsNextStat, essentialAfter, savingsAfter] =
+      await Promise.all([
+        JarPeriodStat.findOne({
+          userId,
+          jarId: essentialJar._id,
+          periodId: currentResponse.body.currentPeriod._id,
+        }),
+        JarPeriodStat.findOne({
+          userId,
+          jarId: savingsJar._id,
+          periodId: currentResponse.body.currentPeriod._id,
+        }),
+        Jar.findById(essentialJar._id),
+        Jar.findById(savingsJar._id),
+      ]);
+
+    // Expense 10k đã vào kỳ mới trước khi modal được xử lý; sweep chỉ chuyển
+    // closingBalance 130k của kỳ cũ, nên lọ Thiết yếu còn đúng -10k hiện tại.
+    expect(essentialNextStat.openingBalance).toBe(0);
+    expect(essentialNextStat.totalExpense).toBe(10_000);
+    expect(essentialAfter.balance).toBe(-10_000);
+
+    // Savings rollover 50k của chính nó + nhận sweep 130k từ Essential.
+    expect(savingsNextStat.openingBalance).toBe(180_000);
+    expect(savingsAfter.balance).toBe(180_000);
+
+    const oldEssentialStat = await JarPeriodStat.findOne({
       userId,
-      jarId: jars[0]._id,
-      periodId: currentResponse.body.currentPeriod._id,
+      jarId: essentialJar._id,
+      periodId: oldPeriod._id,
     });
-    expect(nextStat.openingBalance).toBe(130_000);
-    expect(nextStat.totalExpense).toBe(10_000);
+    expect(oldEssentialStat.closeDecision).toBe("sweep");
+    expect(oldEssentialStat.closeDecisionAmount).toBe(130_000);
 
     const unlockedResponse = await request(app)
       .patch("/api/v1/users/me/settings")
