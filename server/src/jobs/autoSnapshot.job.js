@@ -1,3 +1,6 @@
-// Cron chay dinh ky (vi du moi phut), kiem tra ky nao vua qua 23:59 (theo timezone user)
-// -> goi periodService de tinh closingBalance, set status = 'pending_close'
-// Tham chieu: US4.3 AC1
+// Auto-Snapshot FinancialPeriod đã qua endDate - US4.3 AC1.
+import { snapshotDuePeriods } from "../services/periodService.js";
+
+export async function runAutoSnapshotJob(referenceDate = new Date()) {
+  return snapshotDuePeriods(referenceDate);
+}

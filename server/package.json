@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "test": "NODE_ENV=test vitest run"
+    "test": "vitest run"
   },
   "dependencies": {
     "@six-jars/shared": "1.0.0",

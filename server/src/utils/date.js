@@ -1,69 +1,148 @@
-// Ham xu ly ngay gio theo timezone user (mac dinh Asia/Ho_Chi_Minh),
-// tinh moc 23:59 cuoi ky (dung date-fns)
-//
-// Giai đoạn 2 chỉ cần đủ để suy ra periodKey/startDate/endDate cho 1
-// transactionDate (dùng bởi periodService#getOrCreateCurrentPeriod). Việc
-// tính mốc 23:59 CHÍNH XÁC theo timezone của user (để cron Auto-Snapshot
-// chạy đúng giờ) là việc của Giai đoạn 6 - hàm bên dưới dùng giờ hệ thống
-// (server local time) làm xấp xỉ, đủ dùng để xác định periodId ở giai đoạn
-// hiện tại.
-import {
-  addMonths,
-  endOfDay,
-  getDaysInMonth,
-  setDate,
-  startOfDay,
-  subDays,
-} from "date-fns";
+// Tiện ích kỳ tài chính theo timezone của user.
+// Không phụ thuộc timezone của máy chạy server: mọi mốc start/end được dựng
+// từ calendar date trong timezone user rồi chuyển về UTC để lưu MongoDB.
 
-function clampDayToMonth(date, day) {
-  return Math.min(day, getDaysInMonth(date));
+const DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh";
+
+function daysInMonth(year, monthIndex) {
+  return new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+}
+
+function addCalendarMonth(year, monthIndex, amount = 1) {
+  const date = new Date(Date.UTC(year, monthIndex + amount, 1));
+  return { year: date.getUTCFullYear(), monthIndex: date.getUTCMonth() };
+}
+
+function normalizeTimezone(timezone) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(new Date());
+    return timezone;
+  } catch {
+    return DEFAULT_TIMEZONE;
+  }
+}
+
+export function getZonedDateParts(date, timezone = DEFAULT_TIMEZONE) {
+  const timeZone = normalizeTimezone(timezone);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+
+  const value = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+
+  return {
+    year: Number(value.year),
+    month: Number(value.month),
+    day: Number(value.day),
+    hour: Number(value.hour),
+    minute: Number(value.minute),
+    second: Number(value.second),
+  };
+}
+
+function getTimezoneOffsetMs(date, timezone) {
+  const parts = getZonedDateParts(date, timezone);
+  const representedAsUtc = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+  );
+  const dateWithoutMs = Math.floor(date.getTime() / 1000) * 1000;
+  return representedAsUtc - dateWithoutMs;
+}
+
+function zonedDateTimeToUtc(
+  { year, monthIndex, day, hour = 0, minute = 0, second = 0, millisecond = 0 },
+  timezone,
+) {
+  const timeZone = normalizeTimezone(timezone);
+  const localAsUtc = Date.UTC(
+    year,
+    monthIndex,
+    day,
+    hour,
+    minute,
+    second,
+    millisecond,
+  );
+
+  let candidate = new Date(localAsUtc);
+  let offset = getTimezoneOffsetMs(candidate, timeZone);
+  candidate = new Date(localAsUtc - offset);
+
+  // Chạy lại một lần để xử lý đúng các timezone có DST tại mốc chuyển giờ.
+  const correctedOffset = getTimezoneOffsetMs(candidate, timeZone);
+  if (correctedOffset !== offset) {
+    candidate = new Date(localAsUtc - correctedOffset);
+  }
+
+  return candidate;
 }
 
 /**
- * Tính khoảng thời gian (startDate -> endDate) và periodKey của kỳ tài
- * chính chứa `referenceDate`, dựa trên `monthEndDay` (ngày bắt đầu chu kỳ
- * hằng tháng - tên field kế thừa theo Data Model, xem User.settings.monthEndDay).
- *
- * Ví dụ monthEndDay = 1: kỳ trùng với tháng dương lịch (01/08 -> 31/08).
- * Ví dụ monthEndDay = 5 (ngày lương): kỳ chạy từ 05/08 -> 04/09.
- *
- * @param {Date} referenceDate
- * @param {number} monthEndDay - 1..31, mặc định 1
- * @returns {{ startDate: Date, endDate: Date, periodKey: string }}
+ * Tính kỳ chứa referenceDate.
+ * `monthEndDay` là ngày BẮT ĐẦU chu kỳ theo tên field đã chốt trong Data Model:
+ * 1 => 01/tháng này đến hết ngày cuối tháng; 5 => 05/tháng này đến 04/tháng sau.
  */
-export function getPeriodBounds(referenceDate, monthEndDay = 1) {
-  const day = referenceDate.getDate();
-
-  let cycleStartMonth = new Date(
-    referenceDate.getFullYear(),
-    referenceDate.getMonth(),
-    1,
+export function getPeriodBounds(
+  referenceDate,
+  monthEndDay = 1,
+  timezone = DEFAULT_TIMEZONE,
+) {
+  const zoned = getZonedDateParts(referenceDate, timezone);
+  const currentMonthIndex = zoned.month - 1;
+  const currentStartDay = Math.min(
+    monthEndDay,
+    daysInMonth(zoned.year, currentMonthIndex),
   );
 
-  if (day < monthEndDay) {
-    // referenceDate chưa tới mốc bắt đầu chu kỳ của tháng này -> kỳ hiện tại
-    // thực ra đã bắt đầu từ tháng trước.
-    cycleStartMonth = addMonths(cycleStartMonth, -1);
+  let startYear = zoned.year;
+  let startMonthIndex = currentMonthIndex;
+  if (zoned.day < currentStartDay) {
+    const previous = addCalendarMonth(zoned.year, currentMonthIndex, -1);
+    startYear = previous.year;
+    startMonthIndex = previous.monthIndex;
   }
 
-  const startDate = startOfDay(
-    setDate(cycleStartMonth, clampDayToMonth(cycleStartMonth, monthEndDay)),
+  const startDay = Math.min(
+    monthEndDay,
+    daysInMonth(startYear, startMonthIndex),
+  );
+  const startDate = zonedDateTimeToUtc(
+    { year: startYear, monthIndex: startMonthIndex, day: startDay },
+    timezone,
   );
 
-  const nextCycleStartMonth = addMonths(cycleStartMonth, 1);
-  const nextStartDate = startOfDay(
-    setDate(
-      nextCycleStartMonth,
-      clampDayToMonth(nextCycleStartMonth, monthEndDay),
-    ),
+  const nextMonth = addCalendarMonth(startYear, startMonthIndex, 1);
+  const nextStartDay = Math.min(
+    monthEndDay,
+    daysInMonth(nextMonth.year, nextMonth.monthIndex),
+  );
+  const nextStartDate = zonedDateTimeToUtc(
+    {
+      year: nextMonth.year,
+      monthIndex: nextMonth.monthIndex,
+      day: nextStartDay,
+    },
+    timezone,
   );
 
-  const endDate = endOfDay(subDays(nextStartDate, 1));
-
-  const periodKey = `${startDate.getFullYear()}-${String(
-    startDate.getMonth() + 1,
-  ).padStart(2, "0")}`;
+  const endDate = new Date(nextStartDate.getTime() - 1);
+  const periodKey = `${startYear}-${String(startMonthIndex + 1).padStart(2, "0")}`;
 
   return { startDate, endDate, periodKey };
 }

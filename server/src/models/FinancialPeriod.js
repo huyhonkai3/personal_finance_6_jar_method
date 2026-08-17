@@ -17,27 +17,22 @@ const financialPeriodSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
-    startDay: {
+    startDate: {
       type: Date,
       required: true,
     },
-    // endDate = 23:59:59 ngày cuối kỳ theo timezone user - US 4.3 AC1.
-    // tính đơn giản bằng utils/date.js#getPeriod, chưa xử lý timezone chính xác tuyệt đối - Giai đoạn 6 sẽ thực hiện.
-    // (Auto-snapshot) khi cronjob thực sự cần mốc 23:59 chuẩn xác.
+    // 23:59:59.999 ngày cuối kỳ theo timezone user - US4.3 AC1.
     endDate: {
       type: Date,
       required: true,
     },
-    // pending_close: đã qua auto-snapshot nhưng user chưa xử lý Modal Chốt tháng
-    // chưa xử lý logic chuyển trạng thái ở giai đoạn 2 -> giai đoan 6 sẽ làm
     status: {
       type: String,
       enum: PERIOD_STATUSES,
       default: "open",
     },
-    // Thời điểm cron job tạo snapshot (đúng 23:59) - US 4.3 AC1. Chưa dùng ở
-    // Giai đoạn 2, chỉ khai báo field để Giai đoạn 6 dùng tiếp không phải
-    // migrate schema.
+    // Mốc logical của snapshot. Nếu scheduler chạy trễ vài giây/phút thì vẫn
+    // lưu endDate để snapshot đại diện đúng thời điểm kết thúc kỳ.
     snapshotAt: {
       type: Date,
       default: null,
