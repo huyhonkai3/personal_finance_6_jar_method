@@ -45,7 +45,7 @@ export function calculateStandardSplitAllocations(amount, jars) {
   const order = [...floored].sort((a, b) => b.remainder - a.remainder);
   let i = 0;
   while (remaining > 0 && order.length > 0) {
-    order[i & order.length].amount += 1;
+    order[i % order.length].amount += 1;
     remaining -= 1;
     i += 1;
   }

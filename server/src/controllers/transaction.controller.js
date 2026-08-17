@@ -1,8 +1,5 @@
 // /transactions/parse, /parse-bulk, /bulk-confirm, /:id/jar,
 // GET /transactions, GET /transactions/:id — muc 9
-// Giai đoạn 3: Chỉ xử lý nhánh Chi tiêu (type=expense). Nhánh thu nhập chỉ dừng ở mức nhận diện (trả pendingIncome preview, không lưu DB)
-// việc xử lý phân bổ thực sự thuộc allocationService (Giai đoạn 4, POST /income/confirm).
-// expense-followup (mượn tiền khi thiếu số dư) để dành Giai đoạn 7.
 import mongoose from "mongoose";
 import crypto from "node:crypto";
 
@@ -13,11 +10,12 @@ import { AppError } from "../utils/AppError.js";
 import { normalizeText } from "../utils/text.js";
 import { getOrCreateCurrentPeriod } from "../services/periodService.js";
 import { adjustJarBalance } from "../services/jarBalanceService.js";
+import { adjustTotalExpense } from "../services/jarPeriodStatService.js";
 import { parseTransactionLine } from "../services/parsingService.js";
+import { watchExpenseThreshold } from "../services/thresholdWatcher.js";
 
 const MAX_BULK_LINES = 200;
 
-// HELPER NỘI BỘ
 function splitBulkLines(rawText) {
   return rawText
     .split(/\r?\n/)
@@ -62,19 +60,24 @@ async function createExpenseTransaction({
     session ? { session } : undefined,
   );
 
-  // Chi tiêu -> trừ vào Jar.balance. Giai đoạn 3 tạm thời cho phép số dư âm (chưa kiểm tra đủ/thiếu số dư trước khi lưu).
-  // TODO Giai đoạn 7: trước khi tạo Transaction[expense], kiểm tra
-  // Jar.balance có đủ không - nếu không đủ, KHÔNG lưu ngay mà trả
-  // `pendingExpense` + `insufficientBalance: { shortfall, suggestedSourceJarId }`
-  // cho client gọi tiếp POST /transactions/expense-followup (US6.2 AC1).
+  // Chi tiêu làm giảm cache Jar.balance và đồng thời tăng totalExpense của
+  // đúng lọ/kỳ. thresholdWatcher chịu trách nhiệm chống gửi lặp 80/90%.
   if (jarId) {
     await adjustJarBalance(jarId, -amount, session);
+    await watchExpenseThreshold({
+      userId,
+      jarId,
+      periodId: period._id,
+      amount,
+      session,
+    });
   }
 
+  // TODO Giai đoạn 7: kiểm tra số dư trước khi tạo expense và hoàn thiện
+  // expense-followup / contextual borrowing (US6.2).
   return transaction;
 }
 
-// POST /transactions/parse
 export async function parseTransaction(req, res) {
   const { rawText, transactionDate } = req.body;
   const effectiveDate = transactionDate ?? new Date();
@@ -89,8 +92,6 @@ export async function parseTransaction(req, res) {
     );
   }
 
-  // Nhánh Thu nhập: KHÔNG lưu, trả pendingIncome preview - client gọi tiếp
-  // POST /income/confirm (Giai đoạn 4).
   if (parsed.isIncome) {
     return res.status(200).json({
       pendingIncome: {
@@ -102,8 +103,6 @@ export async function parseTransaction(req, res) {
     });
   }
 
-  // Nhánh Chi tiêu: tạo và lưu ngay (Giai đoạn 3 - xem TODO Giai đoạn 7 ở
-  // createExpenseTransaction).
   const transaction = await createExpenseTransaction({
     userId: req.userId,
     amount: parsed.amount,
@@ -120,7 +119,6 @@ export async function parseTransaction(req, res) {
   res.status(201).json({ transaction, isPredicted: parsed.isPredicted });
 }
 
-// POST /transactions/parse-bulk (US 1.2, US 1.5) - không lưu DB, chỉ trả staging items
 export async function parseBulkTransactions(req, res) {
   const { rawText } = req.body;
   const lines = splitBulkLines(rawText);
@@ -159,12 +157,10 @@ export async function parseBulkTransactions(req, res) {
   res.status(200).json({ items });
 }
 
-// POST /transactions/bulk-confirm (US 1.5 AC4, AC5)
 export async function bulkConfirmTransactions(req, res) {
   const { items, transactionDate } = req.body;
   const effectiveDate = transactionDate ?? new Date();
 
-  // US 1.5 AC4: còn dòng lỗi -> chặn toàn bộ, không lưu gì cả.
   const hasParsedError = items.some((item) => item.isParseError);
   if (hasParsedError) {
     throw new AppError(
@@ -174,20 +170,13 @@ export async function bulkConfirmTransactions(req, res) {
     );
   }
 
-  // Giai đoạn 3 chỉ lưu được Chi tiêu - dòng Thu nhập bị tách riêng, KHÔNG
-  // lưu, trả về để client biết còn phần chưa xử lý.
-  // TODO Giai đoạn 4: xử lý các item.isIncome === true bằng allocationService
-  // (Standard Split hiện hành, đúng như Data Model muc 9.2 mô tả "Dòng
-  // isIncome: true được xử lý theo Standard Split hiện hành") thay vì bỏ qua.
+  // Bulk income vẫn giữ hành vi hiện tại: tách ra để client xử lý riêng.
+  // Việc đồng bộ bulk income với Standard Split sẽ được xử lý độc lập để
+  // không trộn thay đổi ngoài phạm vi Giai đoạn 5 vào transaction Mongo này.
   const expenseItems = items.filter((item) => !item.isIncome);
   const skippedIncomeItems = items.filter((item) => item.isIncome);
 
   const bulkBatchId = crypto.randomUUID();
-
-  // 1 Mongo session cho toàn bộ dòng hợp lệ - US1.5 AC5. LƯU Ý: transaction
-  // Mongo yêu cầu deployment dạng replica set (MongoDB Atlas mặc định chạy
-  // vậy, kể cả gói M0 free - xem Technical Stack muc 4.3); MongoDB standalone
-  // thuần lúc dev local cần bật single-node replica set thì đoạn này mới chạy được.
   const session = await mongoose.startSession();
   let createdTransactions = [];
   try {
@@ -222,7 +211,6 @@ export async function bulkConfirmTransactions(req, res) {
   });
 }
 
-// PATCH /transactions/:id/jar (US 1.3, US 1.4 AC1)
 export async function updateTransactionJar(req, res) {
   const { id } = req.params;
   const { jarId } = req.body;
@@ -240,8 +228,6 @@ export async function updateTransactionJar(req, res) {
   }
 
   if (transaction.type !== "expense") {
-    // Đổi lọ nhanh (thẻ chạm-để-sửa) hiện chỉ áp dụng cho Chi tiêu - Thu
-    // nhập Targeted dùng targetJarId riêng ở /income/confirm (Giai đoạn 4)
     throw new AppError(
       422,
       "VALIDATION_ERROR",
@@ -258,23 +244,31 @@ export async function updateTransactionJar(req, res) {
   const isSameJar = oldJarId && String(oldJarId) === String(jarId);
 
   if (!isSameJar) {
-    // Hoàn lại số dư cho lọ cũ, trừ vào lọ mới - giữ đúng nguyên tắc
-    // Jar.balance luôn tái tạo được 100% từ tổng Transaction chưa xoá.'
     if (oldJarId) {
       await adjustJarBalance(oldJarId, transaction.amount);
+      await adjustTotalExpense(
+        req.userId,
+        oldJarId,
+        transaction.periodId,
+        -transaction.amount,
+      );
     }
+
     await adjustJarBalance(jarId, -transaction.amount);
+    await watchExpenseThreshold({
+      userId: req.userId,
+      jarId,
+      periodId: transaction.periodId,
+      amount: transaction.amount,
+    });
 
     transaction.jarId = jarId;
-    transaction.isPredicted = false; //user đã chủ động xác nhận/sửa
+    transaction.isPredicted = false;
     transaction.editCount += 1;
     transaction.lastEditedAt = new Date();
     await transaction.save();
   }
 
-  // Tự động ghi/nâng cấp PersonalDictionaryRule - US 1.4 AC1. Học theo phần
-  // mô tả đã chuẩn hoá của giao dịch (không phải rawText thô, vì rawText có
-  // thể còn lẫn số tiền/ký tự thừa).
   const keyword = normalizeText(
     transaction.description || transaction.rawText || "",
   );
@@ -292,7 +286,6 @@ export async function updateTransactionJar(req, res) {
   res.status(200).json({ transaction });
 }
 
-// GET /transactions, GET /transactions/:id
 export async function listTransactions(req, res) {
   const {
     periodId,
@@ -302,7 +295,7 @@ export async function listTransactions(req, res) {
     dateTo,
     page = 1,
     limit = 20,
-  } = req.query; //đã qua validate.middleware.js (listTransactionQuerySchema)
+  } = req.query;
 
   const filter = { userId: req.userId, isDeleted: false };
   if (periodId) filter.periodId = periodId;
