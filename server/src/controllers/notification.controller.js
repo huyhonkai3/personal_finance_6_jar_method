@@ -1,8 +1,8 @@
 // GET /notifications, PATCH /notifications/:id/read — muc 14 / Giai đoạn 5
 import { Notification } from "../models/Notification.js";
-import { AppError } from "../models/AppError.js";
+import { AppError } from "../utils/AppError.js";
 
-export async function listNotification(req, res) {
+export async function listNotifications(req, res) {
   const { isRead, page = 1, limit = 20 } = req.query;
 
   const filter = { userId: req.userId };
