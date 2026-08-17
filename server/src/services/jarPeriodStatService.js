@@ -16,8 +16,6 @@ export async function recordAllocatedIncome(
   );
 }
 
-// Dùng khi một expense đã tồn tại được chuyển sang lọ khác. Việc tạo expense
-// mới đi qua thresholdWatcher để vừa cộng totalExpense vừa kiểm tra ngưỡng.
 export async function adjustTotalExpense(
   userId,
   jarId,
@@ -31,4 +29,50 @@ export async function adjustTotalExpense(
     { $inc: { totalExpense: amountDelta } },
     { upsert: true, setDefaultsOnInsert: true, session },
   );
+}
+
+export async function recordTransfer(
+  userId,
+  fromJarId,
+  toJarId,
+  periodId,
+  amount,
+  session,
+) {
+  if (!amount) return;
+  await Promise.all([
+    JarPeriodStat.updateOne(
+      { userId, jarId: fromJarId, periodId },
+      { $inc: { totalTransferOut: amount } },
+      { upsert: true, setDefaultsOnInsert: true, session },
+    ),
+    JarPeriodStat.updateOne(
+      { userId, jarId: toJarId, periodId },
+      { $inc: { totalTransferIn: amount } },
+      { upsert: true, setDefaultsOnInsert: true, session },
+    ),
+  ]);
+}
+
+export async function recordDebtRepaymentStats(
+  userId,
+  debtorJarId,
+  creditorJarId,
+  periodId,
+  amount,
+  session,
+) {
+  if (!amount) return;
+  await Promise.all([
+    JarPeriodStat.updateOne(
+      { userId, jarId: debtorJarId, periodId },
+      { $inc: { totalDebtRepaymentOut: amount } },
+      { upsert: true, setDefaultsOnInsert: true, session },
+    ),
+    JarPeriodStat.updateOne(
+      { userId, jarId: creditorJarId, periodId },
+      { $inc: { totalDebtRepaymentIn: amount } },
+      { upsert: true, setDefaultsOnInsert: true, session },
+    ),
+  ]);
 }

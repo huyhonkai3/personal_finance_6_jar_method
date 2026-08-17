@@ -1,4 +1,6 @@
 // Nghiệp vụ Financial Period: xác định kỳ, Auto-Snapshot và Chốt tháng.
+import mongoose from "mongoose";
+
 import { User } from "../models/User.js";
 import { Jar } from "../models/Jar.js";
 import { FinancialPeriod } from "../models/FinancialPeriod.js";
@@ -20,10 +22,12 @@ export function calculateClosingBalance(stat = {}) {
   );
 }
 
-async function getUserPeriodSettings(userId) {
-  const user = await User.findById(userId).select(
+async function getUserPeriodSettings(userId, session) {
+  let query = User.findById(userId).select(
     "settings.monthEndDay settings.timezone",
   );
+  if (session) query = query.session(session);
+  const user = await query;
   if (!user) {
     throw new AppError(404, "USER_NOT_FOUND", "Không tìm thấy người dùng");
   }
@@ -36,18 +40,28 @@ async function getUserPeriodSettings(userId) {
 export async function getOrCreateCurrentPeriod(
   userId,
   transactionDate = new Date(),
+  session,
 ) {
-  const { monthEndDay, timezone } = await getUserPeriodSettings(userId);
+  const { monthEndDay, timezone } = await getUserPeriodSettings(userId, session);
   const { startDate, endDate, periodKey } = getPeriodBounds(
     transactionDate,
     monthEndDay,
     timezone,
   );
 
-  const existing = await FinancialPeriod.findOne({ userId, periodKey });
+  let existingQuery = FinancialPeriod.findOne({ userId, periodKey });
+  if (session) existingQuery = existingQuery.session(session);
+  const existing = await existingQuery;
   if (existing) return existing;
 
   try {
+    if (session) {
+      const [period] = await FinancialPeriod.create(
+        [{ userId, periodKey, startDate, endDate, status: "open" }],
+        { session },
+      );
+      return period;
+    }
     return await FinancialPeriod.create({
       userId,
       periodKey,
@@ -57,26 +71,20 @@ export async function getOrCreateCurrentPeriod(
     });
   } catch (err) {
     if (err?.code === DUPLICATE_KEY_ERROR_CODE) {
-      const period = await FinancialPeriod.findOne({ userId, periodKey });
+      let retryQuery = FinancialPeriod.findOne({ userId, periodKey });
+      if (session) retryQuery = retryQuery.session(session);
+      const period = await retryQuery;
       if (period) return period;
     }
     throw err;
   }
 }
 
-/**
- * Snapshot một kỳ đã hết hạn. closingBalance được tính hoàn toàn từ
- * JarPeriodStat của chính kỳ đó, không đọc Jar.balance để tránh lẫn giao dịch
- * thuộc kỳ mới khi scheduler chạy trễ.
- */
 export async function snapshotPeriod(period, referenceDate = new Date()) {
   if (!period || period.status !== "open" || period.endDate > referenceDate) {
     return null;
   }
 
-  // Không snapshot kỳ sau khi kỳ trước vẫn chờ quyết định rollover/sweep.
-  // Nếu làm vậy, openingBalance của kỳ sau chưa xác định nên closingBalance
-  // vừa snapshot sẽ sai và tạo cascade sai cho Recalculation Engine sau này.
   const olderPending = await FinancialPeriod.exists({
     userId: period.userId,
     status: "pending_close",
@@ -93,11 +101,10 @@ export async function snapshotPeriod(period, referenceDate = new Date()) {
 
   for (const jar of jars) {
     const current = statByJar.get(String(jar._id));
-    const closingBalance = calculateClosingBalance(current ?? {});
     await JarPeriodStat.updateOne(
       { userId: period.userId, jarId: jar._id, periodId: period._id },
       {
-        $set: { closingBalance },
+        $set: { closingBalance: calculateClosingBalance(current ?? {}) },
         $setOnInsert: { openingBalance: 0, spendingLimit: 0 },
       },
       { upsert: true, setDefaultsOnInsert: true },
@@ -106,20 +113,14 @@ export async function snapshotPeriod(period, referenceDate = new Date()) {
 
   const claimed = await FinancialPeriod.findOneAndUpdate(
     { _id: period._id, status: "open", endDate: { $lte: referenceDate } },
-    {
-      $set: {
-        status: "pending_close",
-        snapshotAt: period.endDate,
-      },
-    },
+    { $set: { status: "pending_close", snapshotAt: period.endDate } },
     { new: true },
   );
   if (!claimed) return null;
 
-  const nextReferenceDate = new Date(period.endDate.getTime() + 1);
   const nextPeriod = await getOrCreateCurrentPeriod(
     period.userId,
-    nextReferenceDate,
+    new Date(period.endDate.getTime() + 1),
   );
 
   const alreadyNotified = await Notification.exists({
@@ -148,8 +149,7 @@ export async function snapshotDuePeriods(referenceDate = new Date()) {
 
   let snapshotCount = 0;
   for (const period of due) {
-    const result = await snapshotPeriod(period, referenceDate);
-    if (result) snapshotCount += 1;
+    if (await snapshotPeriod(period, referenceDate)) snapshotCount += 1;
   }
   return snapshotCount;
 }
@@ -166,8 +166,7 @@ export async function snapshotDuePeriodsForUser(
 
   let snapshotCount = 0;
   for (const period of due) {
-    const result = await snapshotPeriod(period, referenceDate);
-    if (result) snapshotCount += 1;
+    if (await snapshotPeriod(period, referenceDate)) snapshotCount += 1;
   }
   return snapshotCount;
 }
@@ -203,108 +202,119 @@ export async function getPeriodSummary(userId, periodId) {
 }
 
 export async function closeFinancialPeriod(userId, periodId, decisions) {
-  const period = await FinancialPeriod.findOne({
-    _id: periodId,
-    userId,
-    status: "pending_close",
-  });
-  if (!period) {
-    throw new AppError(
-      409,
-      "PERIOD_NOT_PENDING_CLOSE",
-      "Kỳ tài chính không ở trạng thái chờ chốt",
-    );
+  const session = await mongoose.startSession();
+  let result;
+
+  try {
+    await session.withTransaction(async () => {
+      const period = await FinancialPeriod.findOne({
+        _id: periodId,
+        userId,
+        status: "pending_close",
+      }).session(session);
+      if (!period) {
+        throw new AppError(
+          409,
+          "PERIOD_NOT_PENDING_CLOSE",
+          "Kỳ tài chính không ở trạng thái chờ chốt",
+        );
+      }
+
+      const jars = await Jar.find({ userId }).sort({ order: 1 }).session(session);
+      const jarIds = new Set(jars.map((jar) => String(jar._id)));
+      const decisionByJar = new Map(
+        decisions.map((decision) => [String(decision.jarId), decision.action]),
+      );
+
+      if (
+        decisions.length !== jars.length ||
+        decisionByJar.size !== jars.length ||
+        [...decisionByJar.keys()].some((jarId) => !jarIds.has(jarId))
+      ) {
+        throw new AppError(
+          422,
+          "VALIDATION_ERROR",
+          "Cần cung cấp đúng một quyết định cho mỗi lọ",
+        );
+      }
+
+      const sweepTarget = jars.find((jar) => jar.isSweepTarget);
+      if (!sweepTarget) {
+        throw new AppError(
+          500,
+          "SWEEP_TARGET_NOT_FOUND",
+          "Không tìm thấy lọ đích để sweep",
+        );
+      }
+
+      const nextPeriod = await getOrCreateCurrentPeriod(
+        userId,
+        new Date(period.endDate.getTime() + 1),
+        session,
+      );
+      const stats = await JarPeriodStat.find({ userId, periodId }).session(session);
+      const statByJar = new Map(stats.map((stat) => [String(stat.jarId), stat]));
+
+      for (const jar of jars) {
+        const action = decisionByJar.get(String(jar._id));
+        const stat = statByJar.get(String(jar._id));
+        const closingBalance =
+          stat?.closingBalance ?? calculateClosingBalance(stat ?? {});
+
+        await JarPeriodStat.updateOne(
+          { userId, jarId: jar._id, periodId },
+          {
+            $set: {
+              closingBalance,
+              closeDecision: action,
+              closeDecisionAmount: closingBalance,
+            },
+          },
+          { upsert: true, setDefaultsOnInsert: true, session },
+        );
+
+        const shouldSweep =
+          action === "sweep" &&
+          closingBalance > 0 &&
+          String(jar._id) !== String(sweepTarget._id);
+        const targetJarId = shouldSweep ? sweepTarget._id : jar._id;
+
+        await JarPeriodStat.updateOne(
+          { userId, jarId: targetJarId, periodId: nextPeriod._id },
+          {
+            $inc: {
+              openingBalance: closingBalance,
+              spendingLimit: closingBalance,
+            },
+          },
+          { upsert: true, setDefaultsOnInsert: true, session },
+        );
+
+        if (shouldSweep) {
+          await Promise.all([
+            Jar.updateOne(
+              { _id: jar._id, userId },
+              { $inc: { balance: -closingBalance } },
+              { session },
+            ),
+            Jar.updateOne(
+              { _id: sweepTarget._id, userId },
+              { $inc: { balance: closingBalance } },
+              { session },
+            ),
+          ]);
+        }
+      }
+
+      period.status = "closed";
+      period.closedAt = new Date();
+      await period.save({ session });
+      result = { period, nextPeriod };
+    });
+  } finally {
+    await session.endSession();
   }
 
-  const jars = await Jar.find({ userId }).sort({ order: 1 });
-  const jarIds = new Set(jars.map((jar) => String(jar._id)));
-  const decisionByJar = new Map(
-    decisions.map((decision) => [String(decision.jarId), decision.action]),
-  );
-
-  if (
-    decisions.length !== jars.length ||
-    decisionByJar.size !== jars.length ||
-    [...decisionByJar.keys()].some((jarId) => !jarIds.has(jarId))
-  ) {
-    throw new AppError(
-      422,
-      "VALIDATION_ERROR",
-      "Cần cung cấp đúng một quyết định cho mỗi lọ",
-    );
-  }
-
-  const sweepTarget = jars.find((jar) => jar.isSweepTarget);
-  if (!sweepTarget) {
-    throw new AppError(
-      500,
-      "SWEEP_TARGET_NOT_FOUND",
-      "Không tìm thấy lọ đích để sweep",
-    );
-  }
-
-  const nextPeriod = await getOrCreateCurrentPeriod(
-    userId,
-    new Date(period.endDate.getTime() + 1),
-  );
-  const stats = await JarPeriodStat.find({ userId, periodId });
-  const statByJar = new Map(stats.map((stat) => [String(stat.jarId), stat]));
-
-  for (const jar of jars) {
-    const action = decisionByJar.get(String(jar._id));
-    const stat = statByJar.get(String(jar._id));
-    const closingBalance =
-      stat?.closingBalance ?? calculateClosingBalance(stat ?? {});
-
-    await JarPeriodStat.updateOne(
-      { userId, jarId: jar._id, periodId },
-      {
-        $set: {
-          closingBalance,
-          closeDecision: action,
-          closeDecisionAmount: closingBalance,
-        },
-      },
-      { upsert: true, setDefaultsOnInsert: true },
-    );
-
-    const shouldSweep =
-      action === "sweep" &&
-      closingBalance > 0 &&
-      String(jar._id) !== String(sweepTarget._id);
-    const targetJarId = shouldSweep ? sweepTarget._id : jar._id;
-
-    await JarPeriodStat.updateOne(
-      { userId, jarId: targetJarId, periodId: nextPeriod._id },
-      {
-        $inc: {
-          openingBalance: closingBalance,
-          spendingLimit: closingBalance,
-        },
-      },
-      { upsert: true, setDefaultsOnInsert: true },
-    );
-
-    if (shouldSweep) {
-      await Promise.all([
-        Jar.updateOne(
-          { _id: jar._id, userId },
-          { $inc: { balance: -closingBalance } },
-        ),
-        Jar.updateOne(
-          { _id: sweepTarget._id, userId },
-          { $inc: { balance: closingBalance } },
-        ),
-      ]);
-    }
-  }
-
-  period.status = "closed";
-  await period.save();
-
-  // Nếu user bỏ app qua nhiều kỳ, sau khi chốt kỳ cũ nhất thì lập tức cho
-  // kỳ kế tiếp đủ điều kiện chuyển sang pending_close (nếu nó cũng đã hết hạn).
   await snapshotDuePeriodsForUser(userId, new Date());
-
-  return { period, nextPeriod };
+  return result;
 }
