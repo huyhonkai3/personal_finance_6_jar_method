@@ -1,7 +1,9 @@
 // GET /jars, PUT /jars/ratios, PATCH /jars/:jarId — muc 8
 // (GET /jars/:jarId/debts để dành Giai đoạn 7, khi InternalDebt model tồn tại)
 import { Jar } from "../models/Jar.js";
+import { User } from "../models/User.js";
 import { AppError } from "../utils/AppError.js";
+import { formatBalanceForDisplay } from "../utils/money.js";
 
 const REQUIRED_JAR_COUNT = 6;
 const RATIO_TOTAL_TARGET = 100;
@@ -34,8 +36,21 @@ export function validateRatioSum(items) {
 }
 
 export async function listJars(req, res) {
-  const jars = await Jar.find({ userId: req.userId }).sort({ order: 1 });
-  res.status(200).json({ jars });
+  // Fetch song song jars + balanceDisplayMode của user - US2.5 AC1/AC2:
+  // mặc định "rounded" (làm tròn hàng nghìn), user có thể bật "exact" ở
+  // Settings (PATCH /users/me/settings, đã có từ Giai đoạn 1).
+  const [jars, user] = await Promise.all([
+    Jar.find({ usreId: req.userId }).sort({ order: 1 }),
+    User.findById(req.usreId).select("settings.balanceDisplayMode"),
+  ]);
+
+  const balanceDisplayMode = user?.settings?.balanceDisplayMode ?? "rounded";
+  const displayedJars = jars.map((jar) => ({
+    ...jar.toObject(),
+    balance: formatBalanceForDisplay(jar.balance, balanceDisplayMode),
+  }));
+
+  res.status(200).json({ jars: displayedJars, balanceDisplayMode });
 }
 
 export async function updateJarRatios(req, res) {

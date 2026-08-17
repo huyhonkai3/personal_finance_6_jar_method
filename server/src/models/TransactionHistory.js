@@ -39,8 +39,8 @@ const transactionHistorySchema = mongoose.Schema({
   // Danh sách kỳ bị re-calculate dây chuyền - US 5.2 AC2.
   affectedPeriodIds: [{ type: ObjectId, ref: "FinancialPeriod" }],
   // Nếu edit này sinh ra Adjustment Entry - US 5.4 AC2.
-  createAdjustmentTransactionIds: [{ type: ObjectId, ref: "Transaction" }],
-  changeAt: { type: Date, default: Date.now },
+  createdAdjustmentTransactionIds: [{ type: ObjectId, ref: "Transaction" }],
+  changedAt: { type: Date, default: Date.now },
 });
 
 export const TransactionHistory = mongoose.model(

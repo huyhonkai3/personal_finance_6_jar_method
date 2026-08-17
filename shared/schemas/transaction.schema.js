@@ -12,7 +12,7 @@ export const parseTransactionSchema = z.object({
 });
 
 // Body của POST /transactions/parse-bulk
-export const parseBullkTransactionSchema = z.object({
+export const parseBulkTransactionSchema = z.object({
   rawText: z.string().trim().min(1, "Nội dung không được để trống"),
   transactionDate: z.coerce.date().optional(),
 });
@@ -37,12 +37,13 @@ export const bulkConfirmSchema = z.object({
 });
 
 // Body của PATCH /transactions/:id/jar
-export const updateTransactionJarSchemma = z.object({
+export const updateTransactionJarSchema = z.object({
   jarId: objectIdSchema,
 });
 
-// Param :id trên các route /transactions/:id
+// Param :id trên các route /transactions/:id...
 export const transactionIdParamSchema = z.object({
+  id: objectIdSchema,
   periodId: objectIdSchema.optional(),
   jarId: objectIdSchema.optional(),
   type: z.enum(["expense", "income", "transfer", "adjustment"]).optional(),
@@ -50,4 +51,11 @@ export const transactionIdParamSchema = z.object({
   dateTo: z.coerce.date().optional(),
   page: z.coerce.number().int().positive().optional(),
   limit: z.coerce.number().int().positive().max(100).optional(),
+});
+
+// Query params của GET /transactions
+export const listTransactionQuerySchema = z.object({
+  periodId: objectIdSchema.optional(),
+  jarId: objectIdSchema.optional(),
+  type: z.enum[("expense", "income", "transfer", "adjustment")].optional(),
 });

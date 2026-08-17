@@ -111,7 +111,7 @@ export async function parseTransaction(req, res) {
     description: parsed.description,
     jarId: parsed.jarId,
     isPredicted: parsed.isPredicted,
-    predictConfidence: parsed.predictionConfidence,
+    predictionConfidence: parsed.predictionConfidence,
     matchedDictionaryRuleId: parsed.matchedDictionaryRuleId,
     transactionDate: effectiveDate,
     source: "realtime",
@@ -169,7 +169,7 @@ export async function bulkConfirmTransactions(req, res) {
   if (hasParsedError) {
     throw new AppError(
       422,
-      "UNPARSEABLE__LINE",
+      "UNPARSEABLE_LINE",
       "Còn dòng chưa xử lý xong (không nhận diện được) - vui lòng sửa hoặc loại bỏ trước khi xác nhận",
     );
   }
@@ -189,6 +189,7 @@ export async function bulkConfirmTransactions(req, res) {
   // vậy, kể cả gói M0 free - xem Technical Stack muc 4.3); MongoDB standalone
   // thuần lúc dev local cần bật single-node replica set thì đoạn này mới chạy được.
   const session = await mongoose.startSession();
+  let createdTransactions = [];
   try {
     await session.withTransaction(async () => {
       createdTransactions = [];
@@ -303,7 +304,8 @@ export async function listTransactions(req, res) {
     limit = 20,
   } = req.query; //đã qua validate.middleware.js (listTransactionQuerySchema)
 
-  const filter = { userId: req.useId, isDeleted: false };
+  const filter = { userId: req.userId, isDeleted: false };
+  if (periodId) filter.periodId = periodId;
   if (jarId) filter.jarId = jarId;
   if (type) filter.type = type;
   if (dateFrom || dateTo) {

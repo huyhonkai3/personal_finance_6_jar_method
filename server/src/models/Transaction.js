@@ -95,7 +95,7 @@ const transactionSchema = new mongoose.Schema(
     predictionConfidence: { type: Number, min: 0, max: 1, default: null },
     matchedDictionaryRuleId: {
       type: ObjectId,
-      ref: "PersonaDictionaryRule",
+      ref: "PersonalDictionaryRule",
       default: null,
     },
 
@@ -110,12 +110,12 @@ const transactionSchema = new mongoose.Schema(
     // Soft-delete (nguyên tắc thiết kế #2) - phục vụ Audit Trail (US 5.3) và
     // Recalculation Engine (Giai đoạn 8), chưa dùng ở Giai đoạn 3.
     isDeleted: { type: Boolean, default: false },
-    deleteAt: { type: Date, default: null },
+    deletedAt: { type: Date, default: null },
 
     editCount: { type: Number, default: 0 },
-    lastEditedAt: { type: Date, default: 0 },
+    lastEditedAt: { type: Date, default: null },
   },
-  { timestamps },
+  { timestamps: true },
 );
 
 transactionSchema.index({ userId: 1, transactionDate: -1 });

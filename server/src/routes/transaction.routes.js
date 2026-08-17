@@ -3,12 +3,12 @@ import { Router } from "express";
 
 import {
   bulkConfirmSchema,
-  listTransactionQuerySchema,
+  listTransactionsQuerySchema,
   parseBulkTransactionSchema,
   parseTransactionSchema,
   transactionIdParamSchema,
   updateTransactionJarSchema,
-} from "@six-jars/shared/schemas/transaction.schema";
+} from "@six-jars/shared/schemas/transaction.schemajs";
 
 import { authMiddleware } from "../middlewares/auth.middleware.js";
 import { validate } from "../middlewares/validate.middleware.js";
@@ -39,13 +39,12 @@ router.post(
 
 router.get(
   "/",
-  validate(listTransactionQuerySchema, "query"),
+  validate(listTransactionsQuerySchema, "query"),
   listTransactions,
 );
 router.get(
   "/:id",
-  validate(transactionIdParamSchema),
-  "params",
+  validate(transactionIdParamSchema, "params"),
   getTransaction,
 );
 

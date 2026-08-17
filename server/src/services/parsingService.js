@@ -9,7 +9,7 @@
 //     logic tính toán/phân loại vì không có QA riêng).
 //   - Hàm cần DB (Jar, PersonalDictionaryRule): classifyJar, parseTransactionLine.
 import { Jar } from "../models/Jar.js";
-import { PersonaDictionaryRule } from "../models/PersonalDictionaryRule.js";
+import { PersonalDictionaryRule } from "../models/PersonalDictionaryRule.js";
 import { AMOUNT_TOKEN_REGEX, parseAmountToken } from "../utils/money.js";
 import { containsKeyword, normalizeText } from "../utils/text.js";
 
@@ -88,7 +88,7 @@ const DEFAULT_JAR_KEYWORDS = {
 /**
  * Tìm và tách số tiền trong 1 câu văn bản dài (VD: "Ăn trưa: 30k").
  * @param {string} rawText
- * @returns {{ amount: number, matchedText: string} | null}
+ * @returns {{ amount: number, matchedText: string } | null}
  */
 export function extractAmount(rawText) {
   AMOUNT_TOKEN_REGEX.lastIndex = 0; // regex có cờ "g" -> reset state trước mỗi lần dùng
@@ -122,12 +122,13 @@ export function extractDescription(rawText, matchedText) {
  * @param {string} rawText
  */
 export function detectIsIncome(rawText) {
-  const normalized = normalizeText((keyword) =>
-    containsKeyword(normalized, normalizeText(keyword)),
+  const normalized = normalizeText(rawText);
+  return INCOME_KEYWORDS.some((keyword) =>
+    containsKeyword(normalized, normalizeText),
   );
 }
 
-/**+
+/**
  * Chọn quy tắc Từ điển cá nhân khớp nhất với `normalizedText`, ưu tiên
  * keyword dài hơn (cụ thể hơn) nếu có nhiều quy tắc cùng khớp.
  * @param {{ keyword: string, jarId: any, _id: any }[]} rules - đã fetch sẵn từ DB
@@ -135,7 +136,7 @@ export function detectIsIncome(rawText) {
  */
 export function matchDictionaryRule(rules, normalizedText) {
   const matched = rules
-    .filter((rule) => containsKeyword(normalizedText))
+    .filter((rule) => containsKeyword(normalizedText, rule.keyword))
     .sort((a, b) => b.keyword.length - a.keyword.length);
   return matched[0] ?? null;
 }
@@ -165,7 +166,10 @@ export function matchDefaultJarKey(normalizedText) {
  * @param {string} rawText
  */
 export async function classifyJar(userId, rawText) {
-  const normalized = normalizeText(rules, normalized);
+  const normalized = normalizeText(rawText);
+
+  const rules = await PersonalDictionaryRule.find({ userId }).lean();
+  const rule = matchDictionaryRule(rules, normalized);
 
   if (rule) {
     return {
@@ -176,7 +180,7 @@ export async function classifyJar(userId, rawText) {
     };
   }
 
-  const jarKey = matchedDefaultJarKey(normalized);
+  const jarKey = matchDefaultJarKey(normalized);
   const jar = await Jar.findOne({ userId, key: jarKey }).lean();
 
   return {

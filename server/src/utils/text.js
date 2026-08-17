@@ -28,7 +28,7 @@ function escapeRegExp(str) {
  * @param {string} normalizedKeyword - đã qua normalizeText()
  */
 export function containsKeyword(normalizedText, normalizedKeyword) {
-  if (!normalzedKeyword) return false;
+  if (!normalizedKeyword) return false;
   const pattern = new RegExp(`\\b${escapeRegExp(normalizedKeyword)}\\b`, "i");
   return pattern.test(normalizedText);
 }

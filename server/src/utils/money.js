@@ -72,3 +72,12 @@ export function parseAmountToken(token) {
 export function roundToThousand(amount) {
   return Math.round(amount / 1000) * 1000;
 }
+
+/**
+ * Áp dụng chế độ hiển thị số dư theo User.settings.balanceDisplayMode - US2.5.
+ * @param {number} amount
+ * @param {"rounded" | "exact"} mode
+ */
+export function formatBalanceForDisplay(amount, mode) {
+  return mode === "exact" ? amount : roundToThousand(amount);
+}

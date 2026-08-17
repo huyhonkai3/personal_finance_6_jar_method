@@ -18,7 +18,8 @@ import { Jar } from "../models/Jar.js";
 export async function adjustJarBalance(jarId, delta, session) {
   if (!delta) return; // delta = 0 -> không cần đụng DB
   await Jar.updateOne(
-    { _id: jarId, $inc: { balance: delta } },
+    { _id: jarId },
+    { $inc: { balance: delta } },
     session ? { session } : undefined,
   );
 }

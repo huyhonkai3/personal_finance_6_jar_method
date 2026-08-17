@@ -37,13 +37,13 @@ const personalDictionaryRuleSchema = new mongoose.Schema(
       default: 0,
     },
   },
-  { timestamp: true },
+  { timestamps: true },
 );
 
 // Cô lập giữa các user (US 1.4 AC3): user A và user B có quy tắc khác nhau cho từ khóa.
 personalDictionaryRuleSchema.index({ userId: 1, keyword: 1 }, { unique: true });
 
 export const PersonalDictionaryRule = mongoose.model(
-  "PersonaDictionaryRule",
+  "PersonalDictionaryRule",
   personalDictionaryRuleSchema,
 );

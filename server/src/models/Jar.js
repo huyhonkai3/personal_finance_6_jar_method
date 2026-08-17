@@ -29,6 +29,11 @@ const jarSchema = mongoose.Schema(
       required: true,
       immutable: true, // key không đổi được sau khi tạo
     },
+    displayName: {
+      type: String,
+      required: true,
+      trim: true,
+    },
     // Tổng percentage của 6 lọ thuộc cùng 1 user luôn phải = 100.
     // Ràng buộc này được validate ở tầng API (jar.controller.js), không thể
     // validate ở tầng schema vì Mongoose validate từng document độc lập.

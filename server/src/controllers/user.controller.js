@@ -17,7 +17,7 @@ const updateSettingsSchema = z
   });
 
 export async function getMe(req, res) {
-  const user = await User.findOne(req.userId);
+  const user = await User.findById(req.userId);
   if (!user) {
     throw new AppError(404, "USER_NOT_FOUND", "Không tìm thấy user");
   }
