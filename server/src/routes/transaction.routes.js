@@ -8,7 +8,7 @@ import {
   parseTransactionSchema,
   transactionIdParamSchema,
   updateTransactionJarSchema,
-} from "@six-jars/shared/schemas/transaction.schemajs";
+} from "@six-jars/shared/schemas/transaction.schema.js";
 
 import { authMiddleware } from "../middlewares/auth.middleware.js";
 import { validate } from "../middlewares/validate.middleware.js";
