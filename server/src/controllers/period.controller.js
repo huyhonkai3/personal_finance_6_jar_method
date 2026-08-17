@@ -9,9 +9,6 @@ import {
 
 export async function getCurrentPeriod(req, res) {
   const now = new Date();
-
-  // Catch-up ngay khi user mở app: nếu scheduler từng ngừng/chạy trễ thì
-  // endpoint này vẫn biến kỳ quá hạn thành pending_close trước khi trả state.
   await snapshotDuePeriodsForUser(req.userId, now);
 
   const [currentPeriod, pendingPeriod] = await Promise.all([
@@ -40,5 +37,10 @@ export async function closePeriod(req, res) {
     req.params.id,
     req.body.decisions,
   );
+
+  // Data Model yêu cầu lưu thời điểm user hoàn tất modal chốt tháng.
+  result.period.closedAt = new Date();
+  await result.period.save();
+
   res.status(200).json(result);
 }
