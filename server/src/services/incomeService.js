@@ -22,8 +22,16 @@ export async function createIncomeTransaction(
   session,
 ) {
   const period = await getOrCreateCurrentPeriod(userId, transactionDate, session);
+  const isHistorical = period.status !== "open";
   const { allocations, ratioSnapshot, debtRepayments, remainingIncome } =
-    await allocateIncome(userId, amount, incomeType, targetJarId, session);
+    await allocateIncome(
+      userId,
+      amount,
+      incomeType,
+      targetJarId,
+      session,
+      transactionDate,
+    );
 
   const [transaction] = await Transaction.create(
     [
@@ -60,6 +68,7 @@ export async function createIncomeTransaction(
         incomeTransactionId: transaction._id,
         periodId: period._id,
         repaidAt: transactionDate,
+        applyLiveBalance: !isHistorical,
       },
       session,
     );
@@ -67,8 +76,8 @@ export async function createIncomeTransaction(
 
   for (const allocation of allocations) {
     if (!allocation.amount) continue;
-    await Promise.all([
-      adjustJarBalance(allocation.jarId, allocation.amount, session),
+
+    const operations = [
       recordAllocatedIncome(
         userId,
         allocation.jarId,
@@ -76,7 +85,13 @@ export async function createIncomeTransaction(
         allocation.amount,
         session,
       ),
-    ]);
+    ];
+    if (!isHistorical) {
+      operations.push(
+        adjustJarBalance(allocation.jarId, allocation.amount, session),
+      );
+    }
+    await Promise.all(operations);
   }
 
   if (debtRepayments.length > 0) {
