@@ -40,7 +40,7 @@ export async function listJars(req, res) {
   // mặc định "rounded" (làm tròn hàng nghìn), user có thể bật "exact" ở
   // Settings (PATCH /users/me/settings, đã có từ Giai đoạn 1).
   const [jars, user] = await Promise.all([
-    Jar.find({ usreId: req.userId }).sort({ order: 1 }),
+    Jar.find({ userId: req.userId }).sort({ order: 1 }),
     User.findById(req.usreId).select("settings.balanceDisplayMode"),
   ]);
 
