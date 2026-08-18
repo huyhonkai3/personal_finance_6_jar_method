@@ -54,7 +54,7 @@ export const transactionIdParamSchema = z.object({
 });
 
 // Query params của GET /transactions
-export const listTransactionQuerySchema = z.object({
+export const listTransactionsQuerySchema = z.object({
   periodId: objectIdSchema.optional(),
   jarId: objectIdSchema.optional(),
   type: z.enum[("expense", "income", "transfer", "adjustment")].optional(),

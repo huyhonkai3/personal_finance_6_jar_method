@@ -1,8 +1,8 @@
-// Định nghĩa route cho nhóm 'transaction', gắn với transaction.controller.js - muc 9
+// Routes Transaction Engine.
 import { Router } from "express";
-
 import {
   bulkConfirmSchema,
+  expenseFollowupSchema,
   listTransactionsQuerySchema,
   parseBulkTransactionSchema,
   parseTransactionSchema,
@@ -14,6 +14,7 @@ import { authMiddleware } from "../middlewares/auth.middleware.js";
 import { validate } from "../middlewares/validate.middleware.js";
 import {
   bulkConfirmTransactions,
+  expenseFollowup,
   getTransaction,
   listTransactions,
   parseBulkTransactions,
@@ -22,10 +23,14 @@ import {
 } from "../controllers/transaction.controller.js";
 
 const router = Router();
-
 router.use(authMiddleware);
 
 router.post("/parse", validate(parseTransactionSchema), parseTransaction);
+router.post(
+  "/expense-followup",
+  validate(expenseFollowupSchema),
+  expenseFollowup,
+);
 router.post(
   "/parse-bulk",
   validate(parseBulkTransactionSchema),
@@ -36,7 +41,6 @@ router.post(
   validate(bulkConfirmSchema),
   bulkConfirmTransactions,
 );
-
 router.get(
   "/",
   validate(listTransactionsQuerySchema, "query"),
@@ -47,7 +51,6 @@ router.get(
   validate(transactionIdParamSchema, "params"),
   getTransaction,
 );
-
 router.patch(
   "/:id/jar",
   validate(transactionIdParamSchema, "params"),

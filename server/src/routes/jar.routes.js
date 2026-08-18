@@ -1,6 +1,5 @@
-// Định nghĩa route cho nhóm 'jar', gắn với jar.controller.js — muc 8
+// Routes nhóm Jar.
 import { Router } from "express";
-
 import {
   jarIdParamSchema,
   updateJarDisplayNameSchema,
@@ -14,15 +13,14 @@ import {
   updateJar,
   updateJarRatios,
 } from "../controllers/jar.controller.js";
+import { listJarDebts } from "../controllers/debt.controller.js";
 
 const router = Router();
-
 router.use(authMiddleware);
 
 router.get("/", listJars);
-
 router.put("/ratios", validate(updateJarRatiosSchema), updateJarRatios);
-
+router.get("/:jarId/debts", validate(jarIdParamSchema, "params"), listJarDebts);
 router.patch(
   "/:jarId",
   validate(jarIdParamSchema, "params"),
