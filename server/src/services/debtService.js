@@ -34,7 +34,14 @@ export function calculateDebtRepaymentPlan(incomeAmount, debts) {
 }
 
 export async function createDebt(
-  { userId, debtorJarId, creditorJarId, amount, originTransferTransactionId },
+  {
+    userId,
+    debtorJarId,
+    creditorJarId,
+    amount,
+    originTransferTransactionId,
+    createdAt = new Date(),
+  },
   session,
 ) {
   const [debt] = await InternalDebt.create(
@@ -47,6 +54,7 @@ export async function createDebt(
         remainingAmount: amount,
         status: "outstanding",
         originTransferTransactionId,
+        createdAt,
       },
     ],
     session ? { session } : undefined,
