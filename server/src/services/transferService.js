@@ -7,11 +7,16 @@ import { adjustJarBalance } from "./jarBalanceService.js";
 import { recordTransfer } from "./jarPeriodStatService.js";
 import { createDebt } from "./debtService.js";
 
-export function rankBorrowingCandidates(candidates) {
+export function rankBorrowingCandidates(candidates, shortfallAmount = 0) {
   return [...candidates].sort((a, b) => {
+    const coverA = (a.balance ?? 0) >= shortfallAmount ? 0 : 1;
+    const coverB = (b.balance ?? 0) >= shortfallAmount ? 0 : 1;
+    if (coverA !== coverB) return coverA - coverB;
+
     const groupA = a.sensitivityGroup === "flexible" ? 0 : 1;
     const groupB = b.sensitivityGroup === "flexible" ? 0 : 1;
     if (groupA !== groupB) return groupA - groupB;
+
     return (b.balance ?? 0) - (a.balance ?? 0);
   });
 }
@@ -32,7 +37,7 @@ export async function suggestBorrowingSource(userId, jarId, shortfallAmount) {
     balance: { $gt: 0 },
   }).lean();
 
-  const ranked = rankBorrowingCandidates(candidates);
+  const ranked = rankBorrowingCandidates(candidates, shortfallAmount);
   const suggested = ranked[0] ?? null;
 
   return {
@@ -112,7 +117,7 @@ export async function createBorrowTransfer(
     );
   }
 
-  const period = await getOrCreateCurrentPeriod(userId, transactionDate);
+  const period = await getOrCreateCurrentPeriod(userId, transactionDate, session);
   const [transaction] = await Transaction.create(
     [
       {
