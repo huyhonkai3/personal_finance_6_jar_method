@@ -1,16 +1,23 @@
-// Transaction Engine: parse, bulk, expense follow-up, list/detail.
+// Transaction Engine: parse, bulk, edit/delete/history và late backfill.
 import mongoose from "mongoose";
 import crypto from "node:crypto";
 
+import { FinancialPeriod } from "../models/FinancialPeriod.js";
 import { Jar } from "../models/Jar.js";
-import { Transaction } from "../models/Transaction.js";
 import { PersonalDictionaryRule } from "../models/PersonalDictionaryRule.js";
+import { Transaction } from "../models/Transaction.js";
+import { TransactionHistory } from "../models/TransactionHistory.js";
 import { AppError } from "../utils/AppError.js";
 import { normalizeText } from "../utils/text.js";
 import { getOrCreateCurrentPeriod } from "../services/periodService.js";
 import { adjustJarBalance } from "../services/jarBalanceService.js";
 import { adjustTotalExpense } from "../services/jarPeriodStatService.js";
+import { createIncomeTransaction } from "../services/incomeService.js";
 import { parseTransactionLine } from "../services/parsingService.js";
+import {
+  rebuildExpenseTotalsForPeriod,
+  recalculateFromPeriod,
+} from "../services/recalculationEngine.js";
 import { watchExpenseThreshold } from "../services/thresholdWatcher.js";
 import {
   createBorrowTransfer,
@@ -26,6 +33,57 @@ function splitBulkLines(rawText) {
     .filter((line) => line.length > 0);
 }
 
+function emptyRecalc() {
+  return { affectedPeriodIds: [], createdAdjustmentTransactionIds: [] };
+}
+
+function serializeComparable(value) {
+  if (value === null || value === undefined) return value;
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+
+function buildUpdateDiff(transaction, patch) {
+  const diff = [];
+  for (const field of ["amount", "jarId", "transactionDate"]) {
+    if (patch[field] === undefined) continue;
+    const oldValue = transaction[field];
+    const newValue = patch[field];
+    if (serializeComparable(oldValue) === serializeComparable(newValue)) continue;
+    diff.push({ field, oldValue, newValue });
+  }
+  return diff;
+}
+
+async function createHistory(
+  {
+    userId,
+    transactionId,
+    changeType,
+    diff,
+    recalc = emptyRecalc(),
+  },
+  session,
+) {
+  const [history] = await TransactionHistory.create(
+    [
+      {
+        userId,
+        transactionId,
+        changeType,
+        diff,
+        triggeredRecalc: recalc.affectedPeriodIds.length > 0,
+        affectedPeriodIds: recalc.affectedPeriodIds,
+        createdAdjustmentTransactionIds:
+          recalc.createdAdjustmentTransactionIds,
+        changedAt: new Date(),
+      },
+    ],
+    session ? { session } : undefined,
+  );
+  return history;
+}
+
 export async function createExpenseTransaction({
   userId,
   amount,
@@ -39,8 +97,12 @@ export async function createExpenseTransaction({
   source,
   bulkBatchId,
   session,
+  period: providedPeriod,
 }) {
-  const period = await getOrCreateCurrentPeriod(userId, transactionDate);
+  const period =
+    providedPeriod ??
+    (await getOrCreateCurrentPeriod(userId, transactionDate, session));
+
   const [transaction] = await Transaction.create(
     [
       {
@@ -63,16 +125,95 @@ export async function createExpenseTransaction({
   );
 
   if (jarId) {
-    await adjustJarBalance(jarId, -amount, session);
-    await watchExpenseThreshold({
-      userId,
-      jarId,
-      periodId: period._id,
-      amount,
-      session,
-    });
+    if (period.status === "open") {
+      await adjustJarBalance(jarId, -amount, session);
+      await watchExpenseThreshold({
+        userId,
+        jarId,
+        periodId: period._id,
+        amount,
+        session,
+      });
+    } else {
+      // Backfill vào kỳ đã snapshot/closed chỉ sửa ledger lịch sử. Không được
+      // trừ Jar.balance hiện tại trực tiếp; Recalculation Engine sẽ bù bằng
+      // Adjustment Entry tại kỳ hiện tại.
+      await adjustTotalExpense(userId, jarId, period._id, amount, session);
+    }
   }
-  return transaction;
+
+  return { transaction, period };
+}
+
+async function persistParsedExpense({
+  userId,
+  parsed,
+  rawText,
+  transactionDate,
+  source = "realtime",
+  bulkBatchId = null,
+}) {
+  const session = await mongoose.startSession();
+  let result;
+
+  try {
+    await session.withTransaction(async () => {
+      const period = await getOrCreateCurrentPeriod(
+        userId,
+        transactionDate,
+        session,
+      );
+      const created = await createExpenseTransaction({
+        userId,
+        amount: parsed.amount,
+        rawText,
+        description: parsed.description,
+        jarId: parsed.jarId,
+        isPredicted: parsed.isPredicted,
+        predictionConfidence: parsed.predictionConfidence ?? null,
+        matchedDictionaryRuleId: parsed.matchedDictionaryRuleId ?? null,
+        transactionDate,
+        source,
+        bulkBatchId,
+        session,
+        period,
+      });
+
+      let recalc = emptyRecalc();
+      if (period.status !== "open") {
+        recalc = await recalculateFromPeriod(
+          {
+            userId,
+            periodId: period._id,
+            sourceTransactionId: created.transaction._id,
+          },
+          session,
+        );
+        await createHistory(
+          {
+            userId,
+            transactionId: created.transaction._id,
+            changeType: "create",
+            diff: [
+              {
+                field: "lateBackfill",
+                oldValue: null,
+                newValue: transactionDate,
+              },
+            ],
+            recalc,
+          },
+          session,
+        );
+      }
+
+      result = { ...created, recalc };
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  return result;
 }
 
 export async function parseTransaction(req, res) {
@@ -99,50 +240,57 @@ export async function parseTransaction(req, res) {
     });
   }
 
-  const jar = parsed.jarId
-    ? await Jar.findOne({ _id: parsed.jarId, userId: req.userId }).lean()
-    : null;
-  if (jar && jar.balance < parsed.amount) {
-    const shortfallAmount = parsed.amount - jar.balance;
-    const borrowingSuggestion = await suggestBorrowingSource(
-      req.userId,
-      jar._id,
-      shortfallAmount,
-    );
-    return res.status(200).json({
-      pendingExpense: {
-        amount: parsed.amount,
-        description: parsed.description,
-        rawText,
-        jarId: parsed.jarId,
-        isPredicted: parsed.isPredicted,
-        predictionConfidence: parsed.predictionConfidence,
-        matchedDictionaryRuleId: parsed.matchedDictionaryRuleId,
-        transactionDate: effectiveDate,
-      },
-      insufficientBalance: {
-        jarId: jar._id,
-        availableBalance: jar.balance,
+  const period = await getOrCreateCurrentPeriod(req.userId, effectiveDate);
+
+  // Borrowing suggestion chỉ có ý nghĩa với số dư live của kỳ open. Backfill
+  // vào kỳ cũ đi thẳng qua Recalculation Engine.
+  if (period.status === "open") {
+    const jar = parsed.jarId
+      ? await Jar.findOne({ _id: parsed.jarId, userId: req.userId }).lean()
+      : null;
+    if (jar && jar.balance < parsed.amount) {
+      const shortfallAmount = parsed.amount - jar.balance;
+      const borrowingSuggestion = await suggestBorrowingSource(
+        req.userId,
+        jar._id,
         shortfallAmount,
-      },
-      borrowingSuggestion,
-    });
+      );
+      return res.status(200).json({
+        pendingExpense: {
+          amount: parsed.amount,
+          description: parsed.description,
+          rawText,
+          jarId: parsed.jarId,
+          isPredicted: parsed.isPredicted,
+          predictionConfidence: parsed.predictionConfidence,
+          matchedDictionaryRuleId: parsed.matchedDictionaryRuleId,
+          transactionDate: effectiveDate,
+        },
+        insufficientBalance: {
+          jarId: jar._id,
+          availableBalance: jar.balance,
+          shortfallAmount,
+        },
+        borrowingSuggestion,
+      });
+    }
   }
 
-  const transaction = await createExpenseTransaction({
+  const { transaction, recalc } = await persistParsedExpense({
     userId: req.userId,
-    amount: parsed.amount,
+    parsed,
     rawText,
-    description: parsed.description,
-    jarId: parsed.jarId,
-    isPredicted: parsed.isPredicted,
-    predictionConfidence: parsed.predictionConfidence,
-    matchedDictionaryRuleId: parsed.matchedDictionaryRuleId,
     transactionDate: effectiveDate,
-    source: "realtime",
   });
 
-  res.status(201).json({ transaction, isPredicted: parsed.isPredicted });
+  res.status(201).json({
+    transaction,
+    isPredicted: parsed.isPredicted,
+    recalc: {
+      affectedPeriodIds: recalc.affectedPeriodIds,
+      adjustmentsCreated: recalc.createdAdjustmentTransactionIds,
+    },
+  });
 }
 
 export async function expenseFollowup(req, res) {
@@ -157,6 +305,19 @@ export async function expenseFollowup(req, res) {
 
   try {
     await session.withTransaction(async () => {
+      const period = await getOrCreateCurrentPeriod(
+        req.userId,
+        effectiveDate,
+        session,
+      );
+      if (period.status !== "open") {
+        throw new AppError(
+          409,
+          "HISTORICAL_EXPENSE_FOLLOWUP_NOT_REQUIRED",
+          "Giao dịch backdate không dùng luồng mượn tiền theo số dư hiện tại",
+        );
+      }
+
       if (decision === "borrow") {
         const targetJar = await Jar.findOne({
           _id: pendingExpense.jarId,
@@ -189,7 +350,7 @@ export async function expenseFollowup(req, res) {
         }
       }
 
-      transaction = await createExpenseTransaction({
+      const created = await createExpenseTransaction({
         userId: req.userId,
         amount: pendingExpense.amount,
         rawText: pendingExpense.rawText ?? null,
@@ -201,7 +362,9 @@ export async function expenseFollowup(req, res) {
         transactionDate: effectiveDate,
         source: "realtime",
         session,
+        period,
       });
+      transaction = created.transaction;
 
       if (transfer) {
         transfer.transferMeta.relatedExpenseTransactionId = transaction._id;
@@ -256,30 +419,88 @@ export async function bulkConfirmTransactions(req, res) {
     );
   }
 
-  const expenseItems = items.filter((item) => !item.isIncome);
-  const skippedIncomeItems = items.filter((item) => item.isIncome);
   const bulkBatchId = crypto.randomUUID();
   const session = await mongoose.startSession();
-  let createdTransactions = [];
+  const createdTransactions = [];
+
   try {
     await session.withTransaction(async () => {
-      for (const item of expenseItems) {
-        createdTransactions.push(
-          await createExpenseTransaction({
-            userId: req.userId,
-            amount: item.amount,
-            rawText: item.rawText ?? null,
-            description: item.description,
-            jarId: item.jarId,
-            isPredicted: item.isPredicted,
-            predictionConfidence: null,
-            matchedDictionaryRuleId: null,
-            transactionDate: effectiveDate,
-            source: "bulk_input",
-            bulkBatchId,
-            session,
-          }),
+      const period = await getOrCreateCurrentPeriod(
+        req.userId,
+        effectiveDate,
+        session,
+      );
+
+      if (period.status !== "open" && items.some((item) => item.isIncome)) {
+        throw new AppError(
+          422,
+          "HISTORICAL_BULK_INCOME_UNSUPPORTED",
+          "Bulk income backdate vào kỳ đã chốt cần được xác nhận riêng qua Income flow",
         );
+      }
+
+      for (const item of items) {
+        if (item.isIncome) {
+          const income = await createIncomeTransaction(
+            {
+              userId: req.userId,
+              amount: item.amount,
+              description: item.description,
+              rawText: item.rawText ?? null,
+              transactionDate: effectiveDate,
+              incomeType: "standard_split",
+              source: "bulk_input",
+              bulkBatchId,
+            },
+            session,
+          );
+          createdTransactions.push(income.transaction);
+          continue;
+        }
+
+        const expense = await createExpenseTransaction({
+          userId: req.userId,
+          amount: item.amount,
+          rawText: item.rawText ?? null,
+          description: item.description,
+          jarId: item.jarId,
+          isPredicted: item.isPredicted,
+          predictionConfidence: null,
+          matchedDictionaryRuleId: null,
+          transactionDate: effectiveDate,
+          source: "bulk_input",
+          bulkBatchId,
+          session,
+          period,
+        });
+        createdTransactions.push(expense.transaction);
+
+        if (period.status !== "open") {
+          const recalc = await recalculateFromPeriod(
+            {
+              userId: req.userId,
+              periodId: period._id,
+              sourceTransactionId: expense.transaction._id,
+            },
+            session,
+          );
+          await createHistory(
+            {
+              userId: req.userId,
+              transactionId: expense.transaction._id,
+              changeType: "create",
+              diff: [
+                {
+                  field: "lateBackfill",
+                  oldValue: null,
+                  newValue: effectiveDate,
+                },
+              ],
+              recalc,
+            },
+            session,
+          );
+        }
       }
     });
   } finally {
@@ -289,60 +510,138 @@ export async function bulkConfirmTransactions(req, res) {
   res.status(201).json({
     transactions: createdTransactions,
     bulkBatchId,
-    skippedIncomeItems,
+    skippedIncomeItems: [],
+  });
+}
+
+async function performExpenseUpdate(userId, id, patch) {
+  const session = await mongoose.startSession();
+  let result;
+
+  try {
+    await session.withTransaction(async () => {
+      const transaction = await Transaction.findOne({
+        _id: id,
+        userId,
+        isDeleted: false,
+      }).session(session);
+      if (!transaction) {
+        throw new AppError(
+          404,
+          "TRANSACTION_NOT_FOUND",
+          "Không tìm thấy giao dịch",
+        );
+      }
+      if (transaction.type !== "expense") {
+        throw new AppError(
+          422,
+          "TRANSACTION_TYPE_NOT_EDITABLE",
+          "Giai đoạn chỉnh sửa này áp dụng cho giao dịch Chi tiêu",
+        );
+      }
+
+      const diff = buildUpdateDiff(transaction, patch);
+      if (diff.length === 0) {
+        result = { transaction, recalc: emptyRecalc() };
+        return;
+      }
+
+      const oldAmount = transaction.amount;
+      const oldJarId = transaction.jarId;
+      const oldPeriod = await FinancialPeriod.findOne({
+        _id: transaction.periodId,
+        userId,
+      }).session(session);
+
+      const newAmount = patch.amount ?? transaction.amount;
+      const newJarId = patch.jarId ?? transaction.jarId;
+      const newDate = patch.transactionDate ?? transaction.transactionDate;
+
+      if (newJarId) {
+        const newJar = await Jar.findOne({ _id: newJarId, userId }).session(
+          session,
+        );
+        if (!newJar) {
+          throw new AppError(404, "JAR_NOT_FOUND", "Không tìm thấy lọ");
+        }
+      }
+
+      const newPeriod = await getOrCreateCurrentPeriod(userId, newDate, session);
+
+      // Chỉ thay đổi cache trực tiếp đối với phần giao dịch nằm trong kỳ open.
+      // Kỳ closed/pending được phản ánh qua Recalculation Engine.
+      if (oldPeriod?.status === "open" && oldJarId) {
+        await adjustJarBalance(oldJarId, oldAmount, session);
+      }
+      if (newPeriod.status === "open" && newJarId) {
+        await adjustJarBalance(newJarId, -newAmount, session);
+      }
+
+      transaction.amount = newAmount;
+      transaction.jarId = newJarId;
+      transaction.transactionDate = newDate;
+      transaction.periodId = newPeriod._id;
+      transaction.isPredicted = false;
+      transaction.editCount += 1;
+      transaction.lastEditedAt = new Date();
+      await transaction.save({ session });
+
+      await rebuildExpenseTotalsForPeriod(userId, oldPeriod._id, session);
+      if (String(oldPeriod._id) !== String(newPeriod._id)) {
+        await rebuildExpenseTotalsForPeriod(userId, newPeriod._id, session);
+      }
+
+      const nonOpenPeriods = [oldPeriod, newPeriod]
+        .filter((period) => period && period.status !== "open")
+        .sort((a, b) => a.startDate - b.startDate);
+
+      let recalc = emptyRecalc();
+      if (nonOpenPeriods.length > 0) {
+        recalc = await recalculateFromPeriod(
+          {
+            userId,
+            periodId: nonOpenPeriods[0]._id,
+            sourceTransactionId: transaction._id,
+          },
+          session,
+        );
+      }
+
+      await createHistory(
+        {
+          userId,
+          transactionId: transaction._id,
+          changeType: "update",
+          diff,
+          recalc,
+        },
+        session,
+      );
+
+      result = { transaction, recalc };
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  return result;
+}
+
+export async function updateTransaction(req, res) {
+  const result = await performExpenseUpdate(req.userId, req.params.id, req.body);
+  res.status(200).json({
+    transaction: result.transaction,
+    recalc: {
+      affectedPeriodIds: result.recalc.affectedPeriodIds,
+      adjustmentsCreated: result.recalc.createdAdjustmentTransactionIds,
+    },
   });
 }
 
 export async function updateTransactionJar(req, res) {
-  const { id } = req.params;
   const { jarId } = req.body;
-  const transaction = await Transaction.findOne({
-    _id: id,
-    userId: req.userId,
-  });
-  if (!transaction || transaction.isDeleted) {
-    throw new AppError(
-      404,
-      "TRANSACTION_NOT_FOUND",
-      "Không tìm thấy giao dịch",
-    );
-  }
-  if (transaction.type !== "expense") {
-    throw new AppError(
-      422,
-      "VALIDATION_ERROR",
-      "Chỉ có thể đổi lọ cho giao dịch Chi tiêu",
-    );
-  }
-
-  const newJar = await Jar.findOne({ _id: jarId, userId: req.userId });
-  if (!newJar) throw new AppError(404, "JAR_NOT_FOUND", "Không tìm thấy lọ");
-
-  const oldJarId = transaction.jarId;
-  const isSameJar = oldJarId && String(oldJarId) === String(jarId);
-  if (!isSameJar) {
-    if (oldJarId) {
-      await adjustJarBalance(oldJarId, transaction.amount);
-      await adjustTotalExpense(
-        req.userId,
-        oldJarId,
-        transaction.periodId,
-        -transaction.amount,
-      );
-    }
-    await adjustJarBalance(jarId, -transaction.amount);
-    await watchExpenseThreshold({
-      userId: req.userId,
-      jarId,
-      periodId: transaction.periodId,
-      amount: transaction.amount,
-    });
-    transaction.jarId = jarId;
-    transaction.isPredicted = false;
-    transaction.editCount += 1;
-    transaction.lastEditedAt = new Date();
-    await transaction.save();
-  }
+  const result = await performExpenseUpdate(req.userId, req.params.id, { jarId });
+  const transaction = result.transaction;
 
   const keyword = normalizeText(
     transaction.description || transaction.rawText || "",
@@ -357,7 +656,116 @@ export async function updateTransactionJar(req, res) {
       { upsert: true },
     );
   }
-  res.status(200).json({ transaction });
+
+  res.status(200).json({
+    transaction,
+    recalc: {
+      affectedPeriodIds: result.recalc.affectedPeriodIds,
+      adjustmentsCreated: result.recalc.createdAdjustmentTransactionIds,
+    },
+  });
+}
+
+export async function deleteTransaction(req, res) {
+  const session = await mongoose.startSession();
+  let result;
+
+  try {
+    await session.withTransaction(async () => {
+      const transaction = await Transaction.findOne({
+        _id: req.params.id,
+        userId: req.userId,
+        isDeleted: false,
+      }).session(session);
+      if (!transaction) {
+        throw new AppError(
+          404,
+          "TRANSACTION_NOT_FOUND",
+          "Không tìm thấy giao dịch",
+        );
+      }
+      if (transaction.type !== "expense") {
+        throw new AppError(
+          422,
+          "TRANSACTION_TYPE_NOT_EDITABLE",
+          "Giai đoạn chỉnh sửa này áp dụng cho giao dịch Chi tiêu",
+        );
+      }
+
+      const period = await FinancialPeriod.findOne({
+        _id: transaction.periodId,
+        userId: req.userId,
+      }).session(session);
+
+      if (period?.status === "open" && transaction.jarId) {
+        await adjustJarBalance(transaction.jarId, transaction.amount, session);
+      }
+
+      transaction.isDeleted = true;
+      transaction.deletedAt = new Date();
+      transaction.editCount += 1;
+      transaction.lastEditedAt = new Date();
+      await transaction.save({ session });
+
+      await rebuildExpenseTotalsForPeriod(req.userId, period._id, session);
+
+      let recalc = emptyRecalc();
+      if (period.status !== "open") {
+        recalc = await recalculateFromPeriod(
+          {
+            userId: req.userId,
+            periodId: period._id,
+            sourceTransactionId: transaction._id,
+          },
+          session,
+        );
+      }
+
+      await createHistory(
+        {
+          userId: req.userId,
+          transactionId: transaction._id,
+          changeType: "delete",
+          diff: [{ field: "isDeleted", oldValue: false, newValue: true }],
+          recalc,
+        },
+        session,
+      );
+
+      result = { transaction, recalc };
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  res.status(200).json({
+    transaction: result.transaction,
+    recalc: {
+      affectedPeriodIds: result.recalc.affectedPeriodIds,
+      adjustmentsCreated: result.recalc.createdAdjustmentTransactionIds,
+    },
+  });
+}
+
+export async function getTransactionHistory(req, res) {
+  const transaction = await Transaction.findOne({
+    _id: req.params.id,
+    userId: req.userId,
+  }).select("_id");
+  if (!transaction) {
+    throw new AppError(
+      404,
+      "TRANSACTION_NOT_FOUND",
+      "Không tìm thấy giao dịch",
+    );
+  }
+
+  const history = await TransactionHistory.find({
+    userId: req.userId,
+    transactionId: transaction._id,
+  }).sort({ changedAt: -1, _id: -1 });
+
+  res.status(200).json({ history });
 }
 
 export async function listTransactions(req, res) {
@@ -379,6 +787,7 @@ export async function listTransactions(req, res) {
     if (dateFrom) filter.transactionDate.$gte = dateFrom;
     if (dateTo) filter.transactionDate.$lte = dateTo;
   }
+
   const [transactions, total] = await Promise.all([
     Transaction.find(filter)
       .sort({ transactionDate: -1, createdAt: -1 })
