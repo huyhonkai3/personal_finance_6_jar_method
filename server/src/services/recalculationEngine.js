@@ -20,23 +20,24 @@ export async function rebuildExpenseTotalsForPeriod(
   periodId,
   session,
 ) {
-  let query = Transaction.aggregate([
-    {
-      $match: {
-        userId,
-        periodId,
-        type: "expense",
-        isDeleted: false,
-        jarId: { $ne: null },
-      },
-    },
-    { $group: { _id: "$jarId", totalExpense: { $sum: "$amount" } } },
-  ]);
-  if (session) query = query.session(session);
-  const totals = await query;
-  const totalByJar = new Map(
-    totals.map((item) => [asKey(item._id), item.totalExpense]),
-  );
+  let txQuery = Transaction.find({
+    userId,
+    periodId,
+    type: "expense",
+    isDeleted: false,
+    jarId: { $ne: null },
+  }).select("jarId amount");
+  if (session) txQuery = txQuery.session(session);
+  const expenses = await txQuery;
+
+  const totalByJar = new Map();
+  for (const transaction of expenses) {
+    const jarKey = asKey(transaction.jarId);
+    totalByJar.set(
+      jarKey,
+      (totalByJar.get(jarKey) ?? 0) + transaction.amount,
+    );
+  }
 
   let jarsQuery = Jar.find({ userId });
   if (session) jarsQuery = jarsQuery.session(session);
@@ -80,20 +81,24 @@ async function syncSourceAdjustments({
   expectedOpening,
   session,
 }) {
-  const currentStats = await JarPeriodStat.find({
+  let currentStatsQuery = JarPeriodStat.find({
     userId,
     periodId: currentPeriod._id,
-  }).session(session ?? null);
+  });
+  if (session) currentStatsQuery = currentStatsQuery.session(session);
+  const currentStats = await currentStatsQuery;
   const statByJar = new Map(
     currentStats.map((stat) => [asKey(stat.jarId), stat]),
   );
 
-  const existingAdjustments = await Transaction.find({
+  let existingAdjustmentsQuery = Transaction.find({
     userId,
     type: "adjustment",
     periodId: currentPeriod._id,
     isDeleted: false,
-  }).session(session ?? null);
+  });
+  if (session) existingAdjustmentsQuery = existingAdjustmentsQuery.session(session);
+  const existingAdjustments = await existingAdjustmentsQuery;
 
   const sourceAdjustments = new Map();
   const otherAdjustmentTotalByJar = new Map();
@@ -143,7 +148,9 @@ async function syncSourceAdjustments({
       if (existing) {
         existing.isDeleted = true;
         existing.deletedAt = new Date();
-        await existing.save({ session });
+        existing.lastEditedAt = new Date();
+        existing.editCount += 1;
+        await existing.save(session ? { session } : undefined);
       }
       continue;
     }
@@ -155,7 +162,7 @@ async function syncSourceAdjustments({
       existing.adjustmentMeta.affectedPeriodId = affectedPeriodId;
       existing.lastEditedAt = new Date();
       existing.editCount += 1;
-      await existing.save({ session });
+      await existing.save(session ? { session } : undefined);
       createdAdjustmentTransactionIds.push(existing._id);
     } else {
       const [created] = await Transaction.create(
@@ -178,7 +185,7 @@ async function syncSourceAdjustments({
             },
           },
         ],
-        { session },
+        session ? { session } : undefined,
       );
       createdAdjustmentTransactionIds.push(created._id);
     }
@@ -203,20 +210,13 @@ async function syncSourceAdjustments({
           sentAt: new Date(),
         },
       ],
-      { session },
+      session ? { session } : undefined,
     );
   }
 
   return createdAdjustmentTransactionIds;
 }
 
-/**
- * Rebuild tuần tự từ kỳ bị thay đổi tới kỳ hiện tại.
- * - Kỳ đã closed: sửa số liệu lịch sử + opening/closing của chuỗi kỳ.
- * - Kỳ pending_close: cập nhật snapshot đúng rồi dừng, chưa tạo adjustment.
- * - Kỳ open hiện tại: giữ openingBalance thực tế đã từng rollover/sweep và
- *   dùng Transaction[adjustment] để bù chênh lệch, tránh double count.
- */
 export async function recalculateFromPeriod(
   { userId, periodId, sourceTransactionId },
   session,
@@ -254,26 +254,27 @@ export async function recalculateFromPeriod(
       break;
     }
 
-    const stats = await JarPeriodStat.find({
-      userId,
-      periodId: period._id,
-    }).session(session ?? null);
-    const statByJar = new Map(stats.map((stat) => [asKey(stat.jarId), stat]));
-
     if (carryOpening) {
       for (const jar of jars) {
-        await JarPeriodStat.updateOne(
+        const stat = await JarPeriodStat.findOneAndUpdate(
           { userId, jarId: jar._id, periodId: period._id },
-          { $set: { openingBalance: carryOpening.get(asKey(jar._id)) ?? 0 } },
-          { upsert: true, setDefaultsOnInsert: true, session },
+          {
+            $set: { openingBalance: carryOpening.get(asKey(jar._id)) ?? 0 },
+            $setOnInsert: { allocatedIncome: 0 },
+          },
+          { new: true, upsert: true, setDefaultsOnInsert: true, session },
         );
+        stat.spendingLimit = stat.openingBalance + (stat.allocatedIncome ?? 0);
+        await stat.save(session ? { session } : undefined);
       }
     }
 
-    const refreshedStats = await JarPeriodStat.find({
+    let refreshedQuery = JarPeriodStat.find({
       userId,
       periodId: period._id,
-    }).session(session ?? null);
+    });
+    if (session) refreshedQuery = refreshedQuery.session(session);
+    const refreshedStats = await refreshedQuery;
     const refreshedByJar = new Map(
       refreshedStats.map((stat) => [asKey(stat.jarId), stat]),
     );
@@ -296,10 +297,12 @@ export async function recalculateFromPeriod(
       };
     }
 
-    const closedStats = await JarPeriodStat.find({
+    let closedStatsQuery = JarPeriodStat.find({
       userId,
       periodId: period._id,
-    }).session(session ?? null);
+    });
+    if (session) closedStatsQuery = closedStatsQuery.session(session);
+    const closedStats = await closedStatsQuery;
     carryOpening = buildCarryMap(
       jars,
       new Map(closedStats.map((stat) => [asKey(stat.jarId), stat])),
