@@ -33,12 +33,18 @@ export function calculateTargetedAllocation(amount, targetJarId) {
   return [{ jarId: targetJarId, amount }];
 }
 
-/**
- * Hàm này chỉ TÍNH preview. Debt thực sự chỉ bị giảm sau khi user xác nhận
- * income ở controller, tránh preview làm thay đổi dữ liệu.
- */
-export async function allocateIncome(userId, amount, incomeType, targetJarId) {
-  const jars = await Jar.find({ userId }).sort({ order: 1 });
+export async function allocateIncome(
+  userId,
+  amount,
+  incomeType,
+  targetJarId,
+  session,
+  debtAsOf,
+) {
+  let jarsQuery = Jar.find({ userId }).sort({ order: 1 });
+  if (session) jarsQuery = jarsQuery.session(session);
+  const jars = await jarsQuery;
+
   if (jars.length !== 6) {
     throw new AppError(
       500,
@@ -63,7 +69,7 @@ export async function allocateIncome(userId, amount, incomeType, targetJarId) {
   }
 
   const { repayments: debtRepayments, remainingIncome } =
-    await repayOutstandingDebts(userId, amount);
+    await repayOutstandingDebts(userId, amount, session, debtAsOf);
 
   const allocations = calculateStandardSplitAllocations(
     remainingIncome,

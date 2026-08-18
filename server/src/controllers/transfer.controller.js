@@ -2,6 +2,8 @@
 import mongoose from "mongoose";
 
 import { Transaction } from "../models/Transaction.js";
+import { TransactionHistory } from "../models/TransactionHistory.js";
+import { recalculateFromPeriod } from "../services/recalculationEngine.js";
 import {
   createBorrowTransfer,
   suggestBorrowingSource,
@@ -26,9 +28,15 @@ export async function createTransfer(req, res) {
     transactionDate,
     confirmSensitiveWarning,
   } = req.body;
+  const effectiveDate = transactionDate ?? new Date();
 
   const session = await mongoose.startSession();
   let result;
+  let recalc = {
+    affectedPeriodIds: [],
+    createdAdjustmentTransactionIds: [],
+  };
+
   try {
     await session.withTransaction(async () => {
       result = await createBorrowTransfer(
@@ -38,12 +46,45 @@ export async function createTransfer(req, res) {
           toJarId,
           amount,
           note,
-          transactionDate: transactionDate ?? new Date(),
+          transactionDate: effectiveDate,
           trigger: "manual",
           confirmSensitiveWarning,
         },
         session,
       );
+
+      if (result.period.status !== "open") {
+        recalc = await recalculateFromPeriod(
+          {
+            userId: req.userId,
+            periodId: result.period._id,
+            sourceTransactionId: result.transaction._id,
+          },
+          session,
+        );
+        await TransactionHistory.create(
+          [
+            {
+              userId: req.userId,
+              transactionId: result.transaction._id,
+              changeType: "create",
+              diff: [
+                {
+                  field: "lateBackfill",
+                  oldValue: null,
+                  newValue: effectiveDate,
+                },
+              ],
+              triggeredRecalc: recalc.affectedPeriodIds.length > 0,
+              affectedPeriodIds: recalc.affectedPeriodIds,
+              createdAdjustmentTransactionIds:
+                recalc.createdAdjustmentTransactionIds,
+              changedAt: new Date(),
+            },
+          ],
+          { session },
+        );
+      }
     });
   } finally {
     await session.endSession();
@@ -52,6 +93,10 @@ export async function createTransfer(req, res) {
   res.status(201).json({
     transaction: result.transaction,
     debt: result.debt,
+    recalc: {
+      affectedPeriodIds: recalc.affectedPeriodIds,
+      adjustmentsCreated: recalc.createdAdjustmentTransactionIds,
+    },
   });
 }
 

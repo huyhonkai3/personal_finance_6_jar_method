@@ -8,10 +8,6 @@ import {
   recordDebtRepaymentStats,
 } from "./jarPeriodStatService.js";
 
-/**
- * Hàm thuần: lập kế hoạch trả nợ theo FIFO (nợ cũ nhất trước).
- * Không mutate input và không đụng DB, dùng chung cho preview + unit test.
- */
 export function calculateDebtRepaymentPlan(incomeAmount, debts) {
   let remainingIncome = Math.max(0, incomeAmount);
   const ordered = [...debts].sort(
@@ -38,7 +34,14 @@ export function calculateDebtRepaymentPlan(incomeAmount, debts) {
 }
 
 export async function createDebt(
-  { userId, debtorJarId, creditorJarId, amount, originTransferTransactionId },
+  {
+    userId,
+    debtorJarId,
+    creditorJarId,
+    amount,
+    originTransferTransactionId,
+    createdAt = new Date(),
+  },
   session,
 ) {
   const [debt] = await InternalDebt.create(
@@ -51,6 +54,7 @@ export async function createDebt(
         remainingAmount: amount,
         status: "outstanding",
         originTransferTransactionId,
+        createdAt,
       },
     ],
     session ? { session } : undefined,
@@ -59,14 +63,23 @@ export async function createDebt(
 }
 
 /**
- * Chỉ đọc DB và lập preview; KHÔNG thay đổi công nợ.
+ * Chỉ đọc DB và lập kế hoạch. `asOf` dùng cho backfill: một Income lịch sử
+ * không được trả khoản nợ được tạo sau ngày Income đó.
  */
-export async function repayOutstandingDebts(userId, incomeAmount, session) {
-  let query = InternalDebt.find({
+export async function repayOutstandingDebts(
+  userId,
+  incomeAmount,
+  session,
+  asOf,
+) {
+  const filter = {
     userId,
     status: { $in: ["outstanding", "partially_repaid"] },
     remainingAmount: { $gt: 0 },
-  }).sort({ createdAt: 1, _id: 1 });
+  };
+  if (asOf) filter.createdAt = { $lte: asOf };
+
+  let query = InternalDebt.find(filter).sort({ createdAt: 1, _id: 1 });
   if (session) query = query.session(session);
 
   const debts = await query.lean();
@@ -74,22 +87,31 @@ export async function repayOutstandingDebts(userId, incomeAmount, session) {
 }
 
 /**
- * Apply kế hoạch đã preview sau khi Transaction[income] đã có id.
- * Tiền trả nợ được ghi nhận là income đi trực tiếp vào lọ chủ nợ, còn
- * debtRepayments giữ riêng trong incomeMeta để không lẫn với phần standard split.
+ * `applyLiveBalance=false` dùng cho historical backfill: công nợ và số liệu
+ * của kỳ lịch sử vẫn được cập nhật, nhưng Jar.balance hiện tại không được cộng
+ * trực tiếp; Recalculation Engine sẽ tạo Adjustment ở kỳ hiện tại.
  */
 export async function applyDebtRepaymentPlan(
-  { userId, repayments, incomeTransactionId, periodId, repaidAt = new Date() },
+  {
+    userId,
+    repayments,
+    incomeTransactionId,
+    periodId,
+    repaidAt = new Date(),
+    applyLiveBalance = true,
+  },
   session,
 ) {
   const applied = [];
 
   for (const repayment of repayments) {
-    const debt = await InternalDebt.findOne({
+    let debtQuery = InternalDebt.findOne({
       _id: repayment.debtId,
       userId,
       status: { $in: ["outstanding", "partially_repaid"] },
-    }).session(session ?? null);
+    });
+    if (session) debtQuery = debtQuery.session(session);
+    const debt = await debtQuery;
 
     if (!debt || debt.remainingAmount < repayment.amount) {
       throw new AppError(
@@ -116,12 +138,7 @@ export async function applyDebtRepaymentPlan(
       session ? { session } : undefined,
     );
 
-    await Promise.all([
-      Jar.updateOne(
-        { _id: debt.creditorJarId, userId },
-        { $inc: { balance: repayment.amount } },
-        session ? { session } : undefined,
-      ),
+    const operations = [
       recordAllocatedIncome(
         userId,
         debt.creditorJarId,
@@ -137,8 +154,19 @@ export async function applyDebtRepaymentPlan(
         repayment.amount,
         session,
       ),
-    ]);
+    ];
 
+    if (applyLiveBalance) {
+      operations.push(
+        Jar.updateOne(
+          { _id: debt.creditorJarId, userId },
+          { $inc: { balance: repayment.amount } },
+          session ? { session } : undefined,
+        ),
+      );
+    }
+
+    await Promise.all(operations);
     applied.push({ debtId: debt._id, amount: repayment.amount });
   }
 

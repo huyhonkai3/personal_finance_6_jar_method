@@ -1,66 +1,60 @@
-// Cron quét user có settings.salaryDay = hôm nay -> tạo Notification(salary_reminder)
-// Tham chiếu: US2.4 AC1
-// Giai đoạn 4: chỉ implement HÀM chạy job (runSalaryReminderJob). Việc đăng
-// ký lịch chạy thực sự bằng node-cron (jobs/scheduler.js) để dành Giai đoạn 6,
-// khi scheduler.js được dựng chung cho cả job này lẫn autoSnapshot.job.js.
+// Cron nhắc ngày lương theo timezone từng user - US2.4 AC1.
 import { User } from "../models/User.js";
 import { Notification } from "../models/Notification.js";
+import { getZonedDateParts } from "../utils/date.js";
 
 const SALARY_REMINDER_DEEP_LINK = "/input";
+const DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh";
 
-/**
- * Hàm THUẦN: user có nên nhận nhắc nhở lương vào `referenceDate` không, dựa
- * trên `salaryDay` đã cấu hình. Tách riêng để dễ unit test không cần DB.
- * @param {number | null | undefined} salaryDay - 1..31, null nếu chưa cấu hình
- * @param {Date} referenceDate
- */
-export function isSalaryReminderDueTody(salaryDay, referenceDate) {
+export function isSalaryReminderDueToday(
+  salaryDay,
+  referenceDate,
+  timezone = DEFAULT_TIMEZONE,
+) {
   if (!salaryDay) return false;
-  return referenceDate.getDate() === salaryDay;
+  return getZonedDateParts(referenceDate, timezone).day === salaryDay;
 }
 
-function startOfDay(date) {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+// Giữ alias cũ để không làm vỡ test/import đã tồn tại từ Giai đoạn 4.
+export const isSalaryReminderDueTody = isSalaryReminderDueToday;
+
+function isSameZonedCalendarDay(first, second, timezone) {
+  const a = getZonedDateParts(first, timezone);
+  const b = getZonedDateParts(second, timezone);
+  return a.year === b.year && a.month === b.month && a.day === b.day;
 }
 
-function endOfDay(date) {
-  return new Date(
-    date.getFullYear(),
-    date.getMonth(),
-    date.getDate(),
-    23,
-    59,
-    59,
-    999,
-  );
-}
-
-/**
- * Quét toàn bộ user có `settings.salaryDay` = ngày hôm nay (theo
- * `referenceDate`), tạo Notification(salary_reminder) nếu HÔM NAY chưa gửi
- * cho user đó (tránh gửi lặp nếu job chạy nhiều lần/khởi động lại trong
- * cùng 1 ngày).
- *
- * @param {Date} [referenceDate] - mặc định là thời điểm hiện tại
- * @returns {Promise<number>} số Notification đã tạo mới
- */
 export async function runSalaryReminderJob(referenceDate = new Date()) {
-  const day = referenceDate.getDate();
-  const users = await User.find({ "settings.salaryDay": day }).select("_id");
-
-  if (users.length === 0) return 0;
-
-  const todayStart = startOfDay(referenceDate);
-  const todayEnd = endOfDay(referenceDate);
+  const users = await User.find({
+    "settings.salaryDay": { $ne: null },
+  }).select("_id settings.salaryDay settings.timezone");
 
   let createdCount = 0;
   for (const user of users) {
-    const alreadySent = await Notification.exists({
+    const timezone = user.settings?.timezone ?? DEFAULT_TIMEZONE;
+    if (
+      !isSalaryReminderDueToday(
+        user.settings?.salaryDay,
+        referenceDate,
+        timezone,
+      )
+    ) {
+      continue;
+    }
+
+    const latest = await Notification.findOne({
       userId: user._id,
       type: "salary_reminder",
-      sentAt: { $gte: todayStart, $lte: todayEnd },
-    });
-    if (alreadySent) continue;
+    })
+      .sort({ sentAt: -1 })
+      .select("sentAt");
+
+    if (
+      latest &&
+      isSameZonedCalendarDay(latest.sentAt, referenceDate, timezone)
+    ) {
+      continue;
+    }
 
     await Notification.create({
       userId: user._id,

@@ -7,11 +7,16 @@ import { adjustJarBalance } from "./jarBalanceService.js";
 import { recordTransfer } from "./jarPeriodStatService.js";
 import { createDebt } from "./debtService.js";
 
-export function rankBorrowingCandidates(candidates) {
+export function rankBorrowingCandidates(candidates, shortfallAmount = 0) {
   return [...candidates].sort((a, b) => {
+    const coverA = (a.balance ?? 0) >= shortfallAmount ? 0 : 1;
+    const coverB = (b.balance ?? 0) >= shortfallAmount ? 0 : 1;
+    if (coverA !== coverB) return coverA - coverB;
+
     const groupA = a.sensitivityGroup === "flexible" ? 0 : 1;
     const groupB = b.sensitivityGroup === "flexible" ? 0 : 1;
     if (groupA !== groupB) return groupA - groupB;
+
     return (b.balance ?? 0) - (a.balance ?? 0);
   });
 }
@@ -32,7 +37,7 @@ export async function suggestBorrowingSource(userId, jarId, shortfallAmount) {
     balance: { $gt: 0 },
   }).lean();
 
-  const ranked = rankBorrowingCandidates(candidates);
+  const ranked = rankBorrowingCandidates(candidates, shortfallAmount);
   const suggested = ranked[0] ?? null;
 
   return {
@@ -103,7 +108,10 @@ export async function createBorrowTransfer(
     );
   }
 
-  if (fromJar.balance < amount) {
+  const period = await getOrCreateCurrentPeriod(userId, transactionDate, session);
+  const isHistorical = period.status !== "open";
+
+  if (!isHistorical && fromJar.balance < amount) {
     throw new AppError(
       422,
       "INSUFFICIENT_SOURCE_BALANCE",
@@ -112,7 +120,6 @@ export async function createBorrowTransfer(
     );
   }
 
-  const period = await getOrCreateCurrentPeriod(userId, transactionDate);
   const [transaction] = await Transaction.create(
     [
       {
@@ -143,6 +150,7 @@ export async function createBorrowTransfer(
       creditorJarId: fromJarId,
       amount,
       originTransferTransactionId: transaction._id,
+      createdAt: transactionDate,
     },
     session,
   );
@@ -150,11 +158,16 @@ export async function createBorrowTransfer(
   transaction.transferMeta.debtId = debt._id;
   await transaction.save(session ? { session } : undefined);
 
-  await Promise.all([
-    adjustJarBalance(fromJarId, -amount, session),
-    adjustJarBalance(toJarId, amount, session),
+  const operations = [
     recordTransfer(userId, fromJarId, toJarId, period._id, amount, session),
-  ]);
+  ];
+  if (!isHistorical) {
+    operations.push(
+      adjustJarBalance(fromJarId, -amount, session),
+      adjustJarBalance(toJarId, amount, session),
+    );
+  }
+  await Promise.all(operations);
 
-  return { transaction, debt, fromJar, toJar };
+  return { transaction, debt, fromJar, toJar, period };
 }
