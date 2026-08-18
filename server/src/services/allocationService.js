@@ -39,6 +39,7 @@ export async function allocateIncome(
   incomeType,
   targetJarId,
   session,
+  debtAsOf,
 ) {
   let jarsQuery = Jar.find({ userId }).sort({ order: 1 });
   if (session) jarsQuery = jarsQuery.session(session);
@@ -68,7 +69,7 @@ export async function allocateIncome(
   }
 
   const { repayments: debtRepayments, remainingIncome } =
-    await repayOutstandingDebts(userId, amount, session);
+    await repayOutstandingDebts(userId, amount, session, debtAsOf);
 
   const allocations = calculateStandardSplitAllocations(
     remainingIncome,
