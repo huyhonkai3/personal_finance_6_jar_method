@@ -108,7 +108,10 @@ export async function createBorrowTransfer(
     );
   }
 
-  if (fromJar.balance < amount) {
+  const period = await getOrCreateCurrentPeriod(userId, transactionDate, session);
+  const isHistorical = period.status !== "open";
+
+  if (!isHistorical && fromJar.balance < amount) {
     throw new AppError(
       422,
       "INSUFFICIENT_SOURCE_BALANCE",
@@ -117,7 +120,6 @@ export async function createBorrowTransfer(
     );
   }
 
-  const period = await getOrCreateCurrentPeriod(userId, transactionDate, session);
   const [transaction] = await Transaction.create(
     [
       {
@@ -148,6 +150,7 @@ export async function createBorrowTransfer(
       creditorJarId: fromJarId,
       amount,
       originTransferTransactionId: transaction._id,
+      createdAt: transactionDate,
     },
     session,
   );
@@ -155,11 +158,16 @@ export async function createBorrowTransfer(
   transaction.transferMeta.debtId = debt._id;
   await transaction.save(session ? { session } : undefined);
 
-  await Promise.all([
-    adjustJarBalance(fromJarId, -amount, session),
-    adjustJarBalance(toJarId, amount, session),
+  const operations = [
     recordTransfer(userId, fromJarId, toJarId, period._id, amount, session),
-  ]);
+  ];
+  if (!isHistorical) {
+    operations.push(
+      adjustJarBalance(fromJarId, -amount, session),
+      adjustJarBalance(toJarId, amount, session),
+    );
+  }
+  await Promise.all(operations);
 
-  return { transaction, debt, fromJar, toJar };
+  return { transaction, debt, fromJar, toJar, period };
 }
