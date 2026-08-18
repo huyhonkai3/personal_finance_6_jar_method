@@ -34,9 +34,18 @@ export function isWithinEditWindow(
   return date >= calculateEditWindowStart(now, timezone) && date <= now;
 }
 
+function throwExceeded(now, timezone) {
+  throw new AppError(
+    403,
+    "EDIT_WINDOW_EXCEEDED",
+    "Giao dịch đã nằm ngoài phạm vi 12 tháng được phép chỉnh sửa",
+    { editWindowStart: calculateEditWindowStart(now, timezone) },
+  );
+}
+
 export async function editWindowGuard(req, _res, next) {
+  const requestedDate = getCandidateDate(req);
   let transaction = null;
-  let transactionDate = getCandidateDate(req);
 
   if (req.params?.id) {
     transaction = await Transaction.findOne({
@@ -51,22 +60,25 @@ export async function editWindowGuard(req, _res, next) {
         "Không tìm thấy giao dịch",
       );
     }
-    transactionDate = transactionDate ?? transaction.transactionDate;
     req.editWindowTransaction = transaction;
   }
 
-  transactionDate = transactionDate ?? new Date();
   const user = await User.findById(req.userId).select("settings.timezone");
   const timezone = user?.settings?.timezone ?? "Asia/Ho_Chi_Minh";
   const now = new Date();
 
-  if (!isWithinEditWindow(transactionDate, now, timezone)) {
-    throw new AppError(
-      403,
-      "EDIT_WINDOW_EXCEEDED",
-      "Giao dịch đã nằm ngoài phạm vi 12 tháng được phép chỉnh sửa",
-      { editWindowStart: calculateEditWindowStart(now, timezone) },
-    );
+  // Không cho phép "cứu" một transaction đã quá hạn bằng cách PATCH ngày của
+  // nó về hiện tại: bản ghi gốc và ngày đích mới đều phải nằm trong cửa sổ.
+  if (
+    transaction &&
+    !isWithinEditWindow(transaction.transactionDate, now, timezone)
+  ) {
+    throwExceeded(now, timezone);
+  }
+
+  const candidateDate = requestedDate ?? transaction?.transactionDate ?? now;
+  if (!isWithinEditWindow(candidateDate, now, timezone)) {
+    throwExceeded(now, timezone);
   }
 
   next();
